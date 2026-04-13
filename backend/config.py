@@ -1,0 +1,37 @@
+import os
+from pathlib import Path
+
+# Paths
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+POLICIES_DIR = DATA_DIR / "Public Policies"
+CHROMA_DIR = PROJECT_ROOT / "chroma_db"
+UPLOADS_DIR = PROJECT_ROOT / "uploads"
+
+UPLOADS_DIR.mkdir(exist_ok=True)
+
+# LLM
+# Model ID for smolagents OpenAIModel (OpenAI-compatible endpoint, no provider prefix)
+LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gemini-2.5-pro")
+# LiteLLM-style model ID for direct litellm.completion() calls (e.g. evaluate_citation tool)
+LITELLM_MODEL_ID = os.getenv("LITELLM_MODEL_ID", "gemini/gemini-2.5-pro")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# Parallelization
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "8"))
+WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "60"))
+
+# Embedding
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+# Chunking
+CHUNK_SIZE = 500  # tokens approx (~2000 chars)
+CHUNK_OVERLAP = 100  # chars
+
+# RAG
+TOP_K = 10
+CONFIDENCE_THRESHOLD = 0.7
+
+# ChromaDB
+COLLECTION_NAME = "policy_documents"

@@ -1,0 +1,23 @@
+# Core
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+sse-starlette==2.1.0
+
+# AI / Agents
+smolagents[toolkit]==1.24.0
+litellm==1.50.0
+google-generativeai>=0.8.0
+
+# Vector store & embeddings
+chromadb==0.5.23
+sentence-transformers==3.3.1
+
+# PDF processing
+pymupdf==1.25.3
+
+# Data
+pydantic==2.9.2
+
+# Testing
+pytest>=8.0
