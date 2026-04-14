@@ -38,6 +38,7 @@ from backend.config import (
     MAX_CONCURRENT_WORKERS,
 )
 from backend.models.schemas import ComplianceRequirement, Requirement
+from backend.tools.nested_list_parser import ParseNestedListTool
 from backend.tools.cross_reference_resolver import (
     SectionIndex,
     build_section_index,
@@ -205,7 +206,7 @@ class ResolveCrossReferenceTool(Tool):
 # ---------------------------------------------------------------------------
 
 _SECTION_EXTRACTION_INSTRUCTIONS = """\
-You are a compliance requirement extractor. You have THREE tools to help you
+You are a compliance requirement extractor. You have FOUR tools to help you
 extract every obligation from a single regulatory document section.
 
 AVAILABLE TOOLS:
@@ -213,15 +214,28 @@ AVAILABLE TOOLS:
   strip_headers_footers     — (text) removes running headers, footers, and page
                               numbers from the raw text. Always call this before
                               analysis so noise does not pollute your extraction.
+  parse_nested_list         — (text) parses nested enumerations (1 → a → i → A)
+                              into a JSON tree. Each node has 'marker', 'text',
+                              'level', 'path', and 'children' keys. Use this when
+                              the cleaned text contains deeply nested numbered or
+                              lettered lists so you correctly attribute each
+                              sub-item to its parent obligation. Returns '[]' if
+                              no list structure is found (safe to call always).
   resolve_cross_reference   — (section_id) returns the body of a referenced
                               section. Call once per cross-reference you encounter
-                              (e.g. ‘III.A’, ‘Appendix B’, ‘4.2’). Use the
+                              (e.g. 'III.A', 'Appendix B', '4.2'). Use the
                               returned text to understand conditional requirements
                               that span multiple sections.
 
 WORKFLOW:
   1. Call get_section_text to retrieve the raw text.
   2. Call strip_headers_footers(text=<raw text>) to clean it.
+  2.5 (optional) If the cleaned text contains nested numbered or lettered lists,
+      call parse_nested_list(text=<cleaned text>) to get a JSON tree. Walk the
+      tree level-by-level: each parent node provides the obligation context and
+      its children give the specific sub-requirements. Extract one requirement
+      per leaf (or branch) rather than treating sub-items as flat top-level
+      obligations.
   3. Scan the cleaned text for internal cross-references
      ("see Section X", "as defined in Appendix Y", "per Section 4.2", etc.).
      For each distinct referenced section, call resolve_cross_reference(section_id=X)
@@ -389,11 +403,12 @@ def run_section_extractor(
         hf_filter.repeated_signatures if hf_filter else frozenset()
     )
     resolve_tool      = ResolveCrossReferenceTool(section_index or SectionIndex())
+    parse_list_tool   = ParseNestedListTool()
 
     agent = ToolCallingAgent(
-        tools=[get_text_tool, strip_tool, resolve_tool],
+        tools=[get_text_tool, strip_tool, parse_list_tool, resolve_tool],
         model=_make_model(),
-        max_steps=12,   # get_text + strip + up to ~6 resolves + final_answer
+        max_steps=14,   # get_text + strip + parse_list? + up to ~6 resolves + final_answer
         name="section_requirement_extractor",
         description="Extracts compliance requirements from one document section.",
         instructions=_SECTION_EXTRACTION_INSTRUCTIONS,

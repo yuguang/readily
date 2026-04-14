@@ -13,6 +13,7 @@ which is exactly when pytest processes conftest.py files.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from unittest.mock import MagicMock
 
@@ -21,7 +22,7 @@ from unittest.mock import MagicMock
 # ---------------------------------------------------------------------------
 
 for _mod_name in ["chromadb", "litellm"]:
-    if _mod_name not in sys.modules:
+    if _mod_name not in sys.modules and importlib.util.find_spec(_mod_name) is None:
         sys.modules[_mod_name] = MagicMock()
 
 # ---------------------------------------------------------------------------
