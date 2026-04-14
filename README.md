@@ -173,6 +173,12 @@ export MAX_CONCURRENT_WORKERS=8
 export CONFIDENCE_THRESHOLD=0.7
 ```
 
+Alternatively:
+
+```sh
+cp .env.sample .env
+```
+
 ### 5. Policy data
 
 Place the policy PDFs under `data/Public Policies/` with the expected folder structure:
