@@ -161,8 +161,8 @@ def _fallback_evaluation(requirement_id: int, reasoning: str = "") -> Evaluation
 # Retry helpers
 # ---------------------------------------------------------------------------
 
-_MAX_RETRIES = 4
-_BASE_DELAY = 2.0  # seconds
+_MAX_RETRIES = 10
+_BASE_DELAY = 8.0  # seconds
 
 
 def _is_retryable(exc: Exception) -> bool:
