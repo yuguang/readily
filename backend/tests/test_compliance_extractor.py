@@ -22,6 +22,8 @@ import pytest
 
 from backend.agents.compliance_extractor import (
     GetSectionTextTool,
+    ResolveCrossReferenceTool,
+    StripHeadersFootersTool,
     _parse_compliance_requirements,
     assemble_hierarchy,
     deduplicate_requirements,
@@ -510,9 +512,10 @@ class TestParseComplianceRequirements:
 
 
 class TestGetSectionTextTool:
+    """GetSectionTextTool: no-input, returns raw section text + tables."""
+
     def test_interface_contract(self):
-        section = _make_section()
-        tool = GetSectionTextTool(section)
+        tool = GetSectionTextTool(_make_section())
         assert tool.name == "get_section_text"
         assert tool.description
         assert tool.inputs == {}
@@ -525,28 +528,149 @@ class TestGetSectionTextTool:
             page_start=3,
             page_end=5,
         )
-        tool = GetSectionTextTool(section)
-        output = tool()
+        output = GetSectionTextTool(section)()
         assert "Provider Network Requirements" in output
         assert "The MCP must maintain a network." in output
-        assert "3" in output  # page range
+        assert "3" in output
 
     def test_tables_included_in_output(self):
         section = _make_section(
             text="Body text.",
             tables=["| Control | Owner |\n| Training | CO |"],
         )
-        tool = GetSectionTextTool(section)
-        output = tool()
+        output = GetSectionTextTool(section)()
         assert "Training" in output
         assert "[TABLE 1]" in output
         assert "[/TABLE 1]" in output
 
+    def test_no_referenced_sections_block(self):
+        """GetSectionTextTool no longer auto-resolves cross-refs (separate tool)."""
+        section = _make_section(text="See Section III.A for details.")
+        output = GetSectionTextTool(section)()
+        assert "REFERENCED SECTIONS" not in output
+
     def test_empty_section_text(self):
-        section = _make_section(text="", tables=[])
-        tool = GetSectionTextTool(section)
-        output = tool()
+        output = GetSectionTextTool(_make_section(text="", tables=[]))()
         assert isinstance(output, str)
+
+
+# ===========================================================================
+# StripHeadersFootersTool
+# ===========================================================================
+
+
+class TestStripHeadersFootersTool:
+    """StripHeadersFootersTool: text → text, drops header/footer lines."""
+
+    def test_interface_contract(self):
+        tool = StripHeadersFootersTool(frozenset())
+        assert tool.name == "strip_headers_footers"
+        assert "text" in tool.inputs
+        assert tool.inputs["text"]["type"] == "string"
+        assert tool.output_type == "string"
+
+    def test_empty_signatures_is_passthrough(self):
+        tool = StripHeadersFootersTool(frozenset())
+        raw = "Body text line 1.\nBody text line 2."
+        assert tool(text=raw) == raw
+
+    def test_strips_known_header_line(self):
+        sigs = frozenset({"dhcs apl #-#"})  # matches "DHCS APL 24-001"
+        tool = StripHeadersFootersTool(sigs)
+        raw = "DHCS APL 24-001\nThe MCP must maintain records.\nDHCS APL 24-001"
+        result = tool(text=raw)
+        assert "DHCS APL 24-001" not in result
+        assert "The MCP must maintain records." in result
+
+    def test_strips_page_number_line(self):
+        sigs = frozenset({"page #"})  # matches "Page 3", "Page 17"
+        tool = StripHeadersFootersTool(sigs)
+        raw = "Page 3\nThe MCP must train staff annually."
+        result = tool(text=raw)
+        assert "Page 3" not in result
+        assert "train staff" in result
+
+    def test_preserves_body_lines_not_in_sigs(self):
+        sigs = frozenset({"dhcs apl #-#"})
+        tool = StripHeadersFootersTool(sigs)
+        body = "MCPs shall maintain a credentialing program."
+        result = tool(text=body)
+        assert body in result
+
+    def test_multiline_mixed_content(self):
+        sigs = frozenset({"dhcs apl #-#", "page #"})
+        tool = StripHeadersFootersTool(sigs)
+        raw = (
+            "DHCS APL 24-001\n"
+            "Section III: Credentialing\n"
+            "The MCP must maintain records.\n"
+            "Page 12"
+        )
+        result = tool(text=raw)
+        lines = result.splitlines()
+        assert "DHCS APL 24-001" not in lines
+        assert "Page 12" not in lines
+        assert "Section III: Credentialing" in result
+        assert "The MCP must maintain records." in result
+
+
+# ===========================================================================
+# ResolveCrossReferenceTool
+# ===========================================================================
+
+
+class TestResolveCrossReferenceTool:
+    """ResolveCrossReferenceTool: section_id → referenced section text."""
+
+    def _index_with_sections(self):
+        from backend.tools.cross_reference_resolver import build_section_index
+        sections = [
+            _make_section(
+                heading="III.A Initial Credentialing",
+                text="Providers must be credentialed within 60 days.",
+            ),
+            _make_section(
+                heading="Appendix B Definitions",
+                text="Credentialing: the process by which providers are evaluated.",
+            ),
+        ]
+        return build_section_index(sections)
+
+    def test_interface_contract(self):
+        from backend.tools.cross_reference_resolver import SectionIndex
+        tool = ResolveCrossReferenceTool(SectionIndex())
+        assert tool.name == "resolve_cross_reference"
+        assert "section_id" in tool.inputs
+        assert tool.inputs["section_id"]["type"] == "string"
+        assert tool.output_type == "string"
+
+    def test_resolves_known_section(self):
+        tool = ResolveCrossReferenceTool(self._index_with_sections())
+        result = tool(section_id="III.A")
+        assert "60 days" in result
+        assert "III.A" in result
+
+    def test_resolves_appendix(self):
+        tool = ResolveCrossReferenceTool(self._index_with_sections())
+        result = tool(section_id="Appendix B")
+        assert "Credentialing" in result
+
+    def test_unknown_section_returns_not_found(self):
+        tool = ResolveCrossReferenceTool(self._index_with_sections())
+        result = tool(section_id="ZZZZ.999")
+        assert "No section found" in result
+
+    def test_empty_section_id_returns_error(self):
+        from backend.tools.cross_reference_resolver import SectionIndex
+        tool = ResolveCrossReferenceTool(SectionIndex())
+        result = tool(section_id="")
+        assert "Error" in result or "non-empty" in result
+
+    def test_output_includes_heading_and_body(self):
+        tool = ResolveCrossReferenceTool(self._index_with_sections())
+        result = tool(section_id="III.A")
+        assert "Section:" in result
+        assert "credentialed" in result.lower()
 
 
 # ===========================================================================

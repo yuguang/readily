@@ -23,7 +23,6 @@ import logging
 import re
 from collections.abc import AsyncGenerator
 from typing import Any
-from typing import Any
 
 import numpy as np
 from pydantic import ValidationError
@@ -39,31 +38,53 @@ from backend.config import (
     MAX_CONCURRENT_WORKERS,
 )
 from backend.models.schemas import ComplianceRequirement, Requirement
+from backend.tools.cross_reference_resolver import (
+    SectionIndex,
+    build_section_index,
+)
 from backend.tools.document_segmenter import (
     DocumentSection,
     filter_obligation_sections,
     segment_document,
+)
+from backend.tools.header_footer_stripper import (
+    HeaderFooterFilter,
+    _normalize_signature,
+    build_hf_filter_from_pdf,
 )
 from backend.tools.pdf_parser import parse_pdf_with_structure
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Section text tool (one instance per section, closure pattern)
+# Smolagents extraction tools
+# ---------------------------------------------------------------------------
+# Three tools are given to the ToolCallingAgent for each section:
+#
+#   get_section_text          — no-input, returns raw section text + tables
+#   strip_headers_footers     — text → text, removes running header/footer lines
+#   resolve_cross_reference   — section_id → text, looks up a referenced section
+#
+# The agent is free to call them in any order; the instructions guide it to
+# follow: get → strip → resolve (per ref) → final_answer.
 # ---------------------------------------------------------------------------
 
 
 class GetSectionTextTool(Tool):
     """
-    A no-input smolagents tool that returns the text of the document section
-    currently being processed.  Instantiated per extraction call so the
-    closure over ``section`` is safe for parallel use.
+    No-input smolagents tool that returns the raw text of the document section
+    currently being processed, including any embedded tables.
+
+    Instantiated once per extraction call (closure over ``section``).
+    Always call this first; the text may contain running header/footer
+    fragments — clean those with ``strip_headers_footers`` before analysis.
     """
 
     name = "get_section_text"
     description = (
-        "Returns the full text of the document section to analyze, including "
-        "any tables within that section. Call this first before extracting requirements."
+        "Returns the raw text of the document section to analyze, including "
+        "tables. Call this first. The text may contain running header/footer "
+        "noise \u2014 pass it to strip_headers_footers before extracting requirements."
     )
     inputs: dict = {}
     output_type = "string"
@@ -87,19 +108,133 @@ class GetSectionTextTool(Tool):
         return "\n".join(parts)
 
 
+class StripHeadersFootersTool(Tool):
+    """
+    Smolagents tool that removes running headers, footers, and page numbers
+    from raw section text.
+
+    The filter is pre-built from the full document (in
+    :func:`run_compliance_extractor_with_progress`) and passed as
+    ``repeated_signatures`` so that all worker threads share the same
+    read-only set without re-opening the PDF.
+
+    Uses line-level normalization: a line whose normalized form
+    (lowercase, digits → ``#``) matches a known header/footer signature is
+    dropped.  Lines that are structurally part of the section (body text,
+    table rows, heading markers) are preserved.
+    """
+
+    name = "strip_headers_footers"
+    description = (
+        "Remove running headers, footers, and page numbers from raw section text. "
+        "Call this on the text returned by get_section_text before extracting "
+        "requirements. Returns the cleaned text."
+    )
+    inputs = {
+        "text": {
+            "type": "string",
+            "description": "Raw section text returned by get_section_text.",
+        }
+    }
+    output_type = "string"
+
+    def __init__(self, repeated_signatures: frozenset[str]) -> None:
+        super().__init__()
+        self._sigs = repeated_signatures
+
+    def forward(self, text: str) -> str:  # type: ignore[override]
+        if not self._sigs:
+            return text  # no filter data — pass through unchanged
+        cleaned: list[str] = []
+        for line in text.splitlines():
+            sig = _normalize_signature(line.strip())
+            if sig and sig in self._sigs:
+                continue  # drop — this line is a header/footer artifact
+            cleaned.append(line)
+        return "\n".join(cleaned)
+
+
+class ResolveCrossReferenceTool(Tool):
+    """
+    Smolagents tool that looks up an internal cross-reference by section
+    identifier and returns that section’s content.
+
+    Call this when the (cleaned) section text contains phrases like
+    ``\u201csee Section III.A\u201d``, ``\u201cas defined in Appendix B\u201d``, or
+    ``\u201cpursuant to Section 4.2\u201d``.  The LLM can then use the returned text
+    to understand conditional requirements that span multiple sections.
+
+    The :class:`~backend.tools.cross_reference_resolver.SectionIndex` is
+    pre-populated from all document segments before extraction begins.
+    """
+
+    name = "resolve_cross_reference"
+    description = (
+        "Look up a cross-referenced section by identifier and return its text. "
+        "Use when the section contains phrases like \u2018see Section III.A\u2019, "
+        "\u2018as defined in Appendix B\u2019, or \u2018per Section 4.2\u2019. "
+        "Returns the referenced section content, or a not-found message."
+    )
+    inputs = {
+        "section_id": {
+            "type": "string",
+            "description": (
+                "Section identifier to look up, e.g. \u2018III.A\u2019, \u2018Appendix B\u2019, \u20184.2\u2019, "
+                "or a full heading like \u2018III.A Initial Credentialing\u2019."
+            ),
+        }
+    }
+    output_type = "string"
+
+    def __init__(self, section_index: SectionIndex) -> None:
+        super().__init__()
+        self._index = section_index
+
+    def forward(self, section_id: str) -> str:  # type: ignore[override]
+        if not section_id or not section_id.strip():
+            return "Error: section_id must be a non-empty string."
+        result = self._index.resolve(section_id.strip())
+        if result is None:
+            return f"No section found for identifier: {section_id!r}"
+        heading, summary = result
+        return f"Section: {heading}\n\n{summary}"
+
+
 # ---------------------------------------------------------------------------
 # Section extraction prompt
 # ---------------------------------------------------------------------------
 
 _SECTION_EXTRACTION_INSTRUCTIONS = """\
-You are a compliance requirement extractor. You will receive ONE section of a
-regulatory document. Extract every compliance obligation from this section.
+You are a compliance requirement extractor. You have THREE tools to help you
+extract every obligation from a single regulatory document section.
+
+AVAILABLE TOOLS:
+  get_section_text          — (no input) returns the raw section text + tables.
+  strip_headers_footers     — (text) removes running headers, footers, and page
+                              numbers from the raw text. Always call this before
+                              analysis so noise does not pollute your extraction.
+  resolve_cross_reference   — (section_id) returns the body of a referenced
+                              section. Call once per cross-reference you encounter
+                              (e.g. ‘III.A’, ‘Appendix B’, ‘4.2’). Use the
+                              returned text to understand conditional requirements
+                              that span multiple sections.
+
+WORKFLOW:
+  1. Call get_section_text to retrieve the raw text.
+  2. Call strip_headers_footers(text=<raw text>) to clean it.
+  3. Scan the cleaned text for internal cross-references
+     ("see Section X", "as defined in Appendix Y", "per Section 4.2", etc.).
+     For each distinct referenced section, call resolve_cross_reference(section_id=X)
+     to obtain context. Use that context only to clarify conditional logic —
+     do not extract requirements FROM the referenced section.
+  4. Extract all compliance obligations from the CLEANED text (step 2 output).
+  5. Return a JSON array via final_answer.
 
 WHAT TO EXTRACT:
-- Statements using: must, shall, required to, is responsible for, prohibited,
-  may not, should (if normative), within X days, annually, quarterly, upon request
+- must, shall, required to, is responsible for, prohibited, may not,
+  should (if normative), within X days, annually, quarterly, upon request
 - Requirements embedded in tables (each row may be a separate requirement)
-- Conditional requirements ("if X, then must Y")
+- Conditional requirements (“if X, then must Y”)
 
 WHAT TO SKIP:
 - Definitions (unless they contain embedded obligations)
@@ -126,10 +261,10 @@ For each requirement, output a JSON object:
 IMPORTANT:
 - Preserve the EXACT obligation language — do not summarize or paraphrase the
   exact_quote field.
-- Capture conditional logic: "if X, then Y" → condition="if X", action="Y".
+- Capture conditional logic: “if X, then Y” → condition=“if X”, action=“Y”.
 - Tables: treat each row as a potential separate requirement.
 - If a statement is ambiguous between mandatory and recommended, label it
-  "conditional_mandatory" and note the ambiguity in the condition field.
+  “conditional_mandatory” and note the ambiguity in the condition field.
 
 Return a JSON array of requirement objects via final_answer.
 """
@@ -223,18 +358,42 @@ def _make_model() -> OpenAIModel:
     )
 
 
-def run_section_extractor(section: DocumentSection) -> list[ComplianceRequirement]:
+def run_section_extractor(
+    section: DocumentSection,
+    section_index: SectionIndex | None = None,
+    hf_filter: HeaderFooterFilter | None = None,
+) -> list[ComplianceRequirement]:
     """
-    Run the per-section ToolCallingAgent for one :class:`DocumentSection`.
+    Run the per-section :class:`~smolagents.ToolCallingAgent` for one
+    :class:`DocumentSection`.
+
+    The agent receives three tools:
+
+    * ``get_section_text`` — returns raw section text and tables.
+    * ``strip_headers_footers`` — cleans running header/footer noise from text.
+    * ``resolve_cross_reference`` — looks up cross-referenced sections by ID.
+
+    Args:
+        section:       The section to extract from.
+        section_index: Pre-built cross-reference index for the full document.
+                       If ``None``, an empty index is used and cross-reference
+                       lookups will always return “not found”.
+        hf_filter:     Pre-built header/footer filter for the full document.
+                       If ``None``, the strip tool is a no-op pass-through.
 
     Returns an empty list (with a logged warning) if the agent fails or
     returns malformed JSON — never raises.
     """
-    tool = GetSectionTextTool(section)
+    get_text_tool     = GetSectionTextTool(section)
+    strip_tool        = StripHeadersFootersTool(
+        hf_filter.repeated_signatures if hf_filter else frozenset()
+    )
+    resolve_tool      = ResolveCrossReferenceTool(section_index or SectionIndex())
+
     agent = ToolCallingAgent(
-        tools=[tool],
+        tools=[get_text_tool, strip_tool, resolve_tool],
         model=_make_model(),
-        max_steps=5,
+        max_steps=12,   # get_text + strip + up to ~6 resolves + final_answer
         name="section_requirement_extractor",
         description="Extracts compliance requirements from one document section.",
         instructions=_SECTION_EXTRACTION_INSTRUCTIONS,
@@ -242,9 +401,10 @@ def run_section_extractor(section: DocumentSection) -> list[ComplianceRequiremen
     )
     try:
         result = agent.run(
-            f"Call get_section_text to read the section '{section.heading}', "
-            "then extract all compliance requirements and return them as a "
-            "JSON array via final_answer."
+            f"Extract all compliance requirements from section '{section.heading}'. "
+            "Follow the workflow: get_section_text → strip_headers_footers → "
+            "resolve_cross_reference (for each cross-reference found) → "
+            "final_answer with a JSON array of requirements."
         )
         return _parse_compliance_requirements(result, section)
     except Exception as exc:
@@ -592,10 +752,13 @@ async def run_compliance_extractor_with_progress(
         return {"type": "progress", "step": step, "step_number": step_number,
                 "total_steps": _steps, "detail": detail, **extra}
 
-    # Step 1: Structured parse
+    # Step 1: Build header/footer filter then parse with structure
+    # The filter is built in a separate pass so it can be shared with all
+    # per-section extraction workers without re-opening the PDF.
     yield _prog("parsing", 1, "Parsing PDF structure...")
     logger.info("Compliance extractor: parsing %s with structure preservation.", pdf_path)
-    structured_text = parse_pdf_with_structure(pdf_path)
+    hf_filter = build_hf_filter_from_pdf(pdf_path)
+    structured_text = parse_pdf_with_structure(pdf_path, hf_filter=hf_filter)
     if not structured_text.strip():
         logger.warning("Compliance extractor: no text extracted from %s.", pdf_path)
         yield {"type": "complete", "requirements": [], "total_requirements": 0}
@@ -624,6 +787,13 @@ async def run_compliance_extractor_with_progress(
         yield {"type": "complete", "requirements": [], "total_requirements": 0}
         return
 
+    # Build cross-reference index from all segments for context injection
+    section_index = build_section_index(sections)
+    logger.info(
+        "Compliance extractor: cross-reference index built (%d key variants).",
+        len(section_index),
+    )
+
     # Step 4: Parallel per-section extraction with sub-progress
     yield _prog(
         "extracting", 4, "Extracting requirements from sections...",
@@ -635,7 +805,9 @@ async def run_compliance_extractor_with_progress(
 
     async def _extract_one(section: DocumentSection) -> list[ComplianceRequirement]:
         async with semaphore:
-            return await asyncio.to_thread(run_section_extractor, section)
+            return await asyncio.to_thread(
+                run_section_extractor, section, section_index, hf_filter
+            )
 
     tasks = [asyncio.create_task(_extract_one(s)) for s in obligation_sections]
     for coro in asyncio.as_completed(tasks):

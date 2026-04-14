@@ -5,6 +5,11 @@ from typing import List, Dict
 
 import fitz  # PyMuPDF
 
+from backend.tools.header_footer_stripper import (
+    HeaderFooterFilter,
+    build_header_footer_filter,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -125,15 +130,24 @@ def parse_pdf(pdf_path: str) -> List[Dict]:
     return pages
 
 
-def parse_pdf_with_structure(pdf_path: str) -> str:
+def parse_pdf_with_structure(
+    pdf_path: str,
+    hf_filter: HeaderFooterFilter | None = None,
+) -> str:
     """
     Parse a PDF preserving headings, tables, and page boundaries.
 
     Uses PyMuPDF block-level extraction to detect heading levels from font
     sizes and ``find_tables()`` to extract tables as pipe-delimited text.
+    Running headers, footers, and page numbers are stripped automatically
+    via :func:`~backend.tools.header_footer_stripper.build_header_footer_filter`.
 
     Args:
-        pdf_path: Path to the PDF file.
+        pdf_path:  Path to the PDF file.
+        hf_filter: Pre-built :class:`~backend.tools.header_footer_stripper.HeaderFooterFilter`.
+                   When ``None`` (default) the filter is built automatically
+                   from the document.  Pass an empty
+                   ``HeaderFooterFilter()`` to disable stripping entirely.
 
     Returns:
         Structured text with ``[PAGE N]``, ``[HEADING N] text``, and
@@ -147,16 +161,21 @@ def parse_pdf_with_structure(pdf_path: str) -> str:
         return ""
 
     try:
-        # --- Pass 1: determine heading font sizes across the whole document ---
+        # --- Pass 1: font-size survey + header/footer detection ---------------
         font_size_counts = _collect_font_sizes(doc)
         heading_map = _build_heading_size_map(font_size_counts)
 
+        if hf_filter is None:
+            hf_filter = build_header_footer_filter(doc)
+        stripped_count = 0
+
         parts: list[str] = []
 
-        # --- Pass 2: build structured text page by page ---
+        # --- Pass 2: build structured text page by page -----------------------
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             page_number = page_idx + 1
+            page_height = page.rect.height
             parts.append(f"[PAGE {page_number}]")
 
             # Detect tables on this page
@@ -182,6 +201,10 @@ def parse_pdf_with_structure(pdf_path: str) -> str:
                     continue
                 # Skip text blocks that lie inside a table bounding box
                 if any(_rect_intersects(block["bbox"], tab.bbox) for tab in tables):
+                    continue
+                # Skip header/footer blocks
+                if hf_filter.is_header_footer(block, page_height):
+                    stripped_count += 1
                     continue
 
                 # Determine dominant font size and full block text
@@ -216,6 +239,12 @@ def parse_pdf_with_structure(pdf_path: str) -> str:
                     else:
                         parts.append(block_text)
 
+        if stripped_count:
+            logger.debug(
+                "Stripped %d header/footer blocks from %s.",
+                stripped_count,
+                pdf_path,
+            )
         return "\n".join(parts)
     finally:
         doc.close()
