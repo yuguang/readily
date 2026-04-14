@@ -18,11 +18,20 @@ LITELLM_MODEL_ID = os.getenv("LITELLM_MODEL_ID", "gemini/gemini-2.5-pro")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+# Compliance extraction model — defaults to gpt-4.1-mini (OpenAI).
+# Override via env vars to use a different model or provider.
+# Set COMPLIANCE_LLM_API_BASE to a non-empty string to route through a
+# custom OpenAI-compatible endpoint (e.g. the Gemini base URL above).
+COMPLIANCE_LLM_MODEL_ID = os.getenv("COMPLIANCE_LLM_MODEL_ID", "gpt-5.4-mini")  # override with e.g. gpt-4.1, gpt-4.1-mini, gpt-4o-mini
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+COMPLIANCE_LLM_API_BASE = os.getenv("COMPLIANCE_LLM_API_BASE", "")  # empty = OpenAI default
+
 # Routing
 LONG_DOC_PAGE_THRESHOLD = int(os.getenv("LONG_DOC_PAGE_THRESHOLD", "20"))
 
 # Parallelization
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "8"))
+COMPLIANCE_MAX_CONCURRENT_WORKERS = int(os.getenv("COMPLIANCE_MAX_CONCURRENT_WORKERS", "20"))
 WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "300"))
 INGEST_MAX_WORKERS = int(os.getenv("INGEST_MAX_WORKERS", "4"))
 

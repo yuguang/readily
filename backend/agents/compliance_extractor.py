@@ -39,12 +39,12 @@ from sentence_transformers import SentenceTransformer
 from smolagents import OpenAIModel, Tool, ToolCallingAgent
 
 from backend.config import (
+    COMPLIANCE_LLM_API_BASE,
+    COMPLIANCE_LLM_MODEL_ID,
     DEDUP_SIMILARITY_THRESHOLD,
     EMBEDDING_MODEL,
-    GEMINI_API_KEY,
-    GEMINI_API_BASE,
-    LLM_MODEL_ID,
-    MAX_CONCURRENT_WORKERS,
+    OPENAI_API_KEY,
+    COMPLIANCE_MAX_CONCURRENT_WORKERS,
 )
 from backend.models.schemas import ComplianceRequirement, Requirement
 from backend.tools.nested_list_parser import ParseNestedListTool
@@ -401,12 +401,21 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 def _make_model() -> OpenAIModel:
-    return OpenAIModel(
-        model_id=LLM_MODEL_ID,
-        api_key=GEMINI_API_KEY,
-        api_base=GEMINI_API_BASE,
-        temperature=0.2,
-    )
+    """Build the :class:`~smolagents.OpenAIModel` for compliance extraction.
+
+    Uses :data:`~backend.config.COMPLIANCE_LLM_MODEL_ID` (default
+    ``gpt-4.1-mini``) and :data:`~backend.config.OPENAI_API_KEY`.
+    Set ``COMPLIANCE_LLM_API_BASE`` to route through an OpenAI-compatible
+    endpoint instead (e.g. the Gemini base URL).
+    """
+    kwargs: dict[str, Any] = {
+        "model_id": COMPLIANCE_LLM_MODEL_ID,
+        "api_key": OPENAI_API_KEY,
+        "temperature": 0.2,
+    }
+    if COMPLIANCE_LLM_API_BASE:
+        kwargs["api_base"] = COMPLIANCE_LLM_API_BASE
+    return OpenAIModel(**kwargs)
 
 
 def run_section_extractor(
@@ -501,7 +510,7 @@ async def extract_from_all_sections(
     """
     Extract compliance requirements from all sections concurrently.
 
-    Uses a semaphore to cap parallelism at ``MAX_CONCURRENT_WORKERS``.
+    Uses a semaphore to cap parallelism at ``COMPLIANCE_MAX_CONCURRENT_WORKERS``.
     Each section runs in a thread via :func:`asyncio.to_thread`.
 
     Args:
@@ -510,7 +519,7 @@ async def extract_from_all_sections(
     Returns:
         Flat list of all extracted :class:`ComplianceRequirement` objects.
     """
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+    semaphore = asyncio.Semaphore(COMPLIANCE_MAX_CONCURRENT_WORKERS)
 
     async def extract_one(section: DocumentSection) -> list[ComplianceRequirement]:
         async with semaphore:
@@ -875,7 +884,7 @@ async def run_compliance_extractor_with_progress(
     )
     raw_requirements: list[ComplianceRequirement] = []
     completed = 0
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+    semaphore = asyncio.Semaphore(COMPLIANCE_MAX_CONCURRENT_WORKERS)
 
     async def _extract_one(section: DocumentSection) -> list[ComplianceRequirement]:
         async with semaphore:
