@@ -7,8 +7,10 @@ ensuring no memory or state leakage between parallel workers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 from typing import Any
 
 from smolagents import OpenAIModel, ToolCallingAgent
@@ -156,6 +158,20 @@ def _fallback_evaluation(requirement_id: int, reasoning: str = "") -> Evaluation
 
 
 # ---------------------------------------------------------------------------
+# Retry helpers
+# ---------------------------------------------------------------------------
+
+_MAX_RETRIES = 4
+_BASE_DELAY = 2.0  # seconds
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True if the exception is a transient 503/UNAVAILABLE error."""
+    msg = str(exc)
+    return "503" in msg or "UNAVAILABLE" in msg or "high demand" in msg
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -168,25 +184,56 @@ async def run_question_agent(
 
     A new agent instance is created for every call so that no conversation
     history or tool state is shared between parallel workers.
+
+    Retries up to ``_MAX_RETRIES`` times with exponential backoff on transient
+    503/UNAVAILABLE errors from the upstream model API.
     """
-    agent = create_question_agent(model)
     task = (
         f"Evaluate this compliance requirement against the policy corpus:\n\n"
         f"Requirement #{requirement.id}: {requirement.text}\n"
         f"Reference: {requirement.reference or 'N/A'}"
     )
 
-    try:
-        result = agent.run(task)
-    except Exception as exc:
-        logger.error(
-            "Agent exceeded max_steps or failed for requirement %d: %s",
-            requirement.id,
-            exc,
-        )
-        return _fallback_evaluation(
-            requirement.id,
-            reasoning=f"Agent error: {exc}",
-        )
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        # Create a fresh agent each attempt (no state leakage between retries)
+        agent = create_question_agent(model)
+        try:
+            result = agent.run(task)
+            return parse_agent_result(result, requirement.id)
+        except Exception as exc:
+            if _is_retryable(exc) and attempt < _MAX_RETRIES:
+                delay = _BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                logger.warning(
+                    "Requirement %d — transient error (attempt %d/%d), retrying in %.1fs: %s",
+                    requirement.id,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                last_exc = exc
+            else:
+                logger.error(
+                    "Agent failed for requirement %d after %d attempt(s): %s",
+                    requirement.id,
+                    attempt + 1,
+                    exc,
+                )
+                return _fallback_evaluation(
+                    requirement.id,
+                    reasoning=f"Agent error: {exc}",
+                )
 
-    return parse_agent_result(result, requirement.id)
+    # Exhausted all retries
+    logger.error(
+        "Agent failed for requirement %d after %d retries: %s",
+        requirement.id,
+        _MAX_RETRIES,
+        last_exc,
+    )
+    return _fallback_evaluation(
+        requirement.id,
+        reasoning=f"Agent error after {_MAX_RETRIES} retries: {last_exc}",
+    )
