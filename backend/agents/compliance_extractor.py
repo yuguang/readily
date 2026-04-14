@@ -24,6 +24,15 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+    before_sleep_log,
+    RetryError,
+)
+
 import numpy as np
 from pydantic import ValidationError
 from sentence_transformers import SentenceTransformer
@@ -359,6 +368,34 @@ def _parse_compliance_requirements(
 
 
 # ---------------------------------------------------------------------------
+# Retry helpers for transient API errors (503 / 429)
+# ---------------------------------------------------------------------------
+
+# Maximum number of attempts (1 initial + 4 retries → waits of ~4, 8, 16, 32 s
+# plus jitter, capped at 60 s, so the worst-case extra wait is ~120 s total).
+_MAX_ATTEMPTS = 5
+
+# Keywords that identify a transient Gemini API error worth retrying.
+# 429 RESOURCE_EXHAUSTED = rate limit hit.
+# 503 UNAVAILABLE        = high-demand overload (the error seen in logs).
+_RETRYABLE_SUBSTRINGS: tuple[str, ...] = (
+    "503",
+    "429",
+    "UNAVAILABLE",
+    "RESOURCE_EXHAUSTED",
+    "high demand",
+    "rate limit",
+    "quota",
+)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Return True when *exc* looks like a transient Gemini API error."""
+    msg = str(exc).upper()
+    return any(s.upper() in msg for s in _RETRYABLE_SUBSTRINGS)
+
+
+# ---------------------------------------------------------------------------
 # Per-section LLM extraction
 # ---------------------------------------------------------------------------
 
@@ -414,15 +451,37 @@ def run_section_extractor(
         instructions=_SECTION_EXTRACTION_INSTRUCTIONS,
         verbosity_level=0,
     )
-    try:
-        result = agent.run(
+
+    @retry(
+        retry=retry_if_exception(_is_retryable),
+        wait=wait_exponential_jitter(initial=4, max=60),
+        stop=stop_after_attempt(_MAX_ATTEMPTS),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=False,   # wrap final failure in RetryError, handled below
+    )
+    def _call_agent() -> Any:
+        return agent.run(
             f"Extract all compliance requirements from section '{section.heading}'. "
             "Follow the workflow: get_section_text → strip_headers_footers → "
             "resolve_cross_reference (for each cross-reference found) → "
             "final_answer with a JSON array of requirements."
         )
+
+    try:
+        result = _call_agent()
         return _parse_compliance_requirements(result, section)
+    except RetryError as exc:
+        # All _MAX_ATTEMPTS retryable failures exhausted
+        cause = exc.last_attempt.exception()
+        logger.warning(
+            "Section %r: gave up after %d attempts (%s). Marking for human review.",
+            section.heading,
+            _MAX_ATTEMPTS,
+            cause,
+        )
+        return []
     except Exception as exc:
+        # Non-retryable error (bad JSON, agent logic failure, etc.)
         logger.warning(
             "Section %r: extraction failed: %s. Marking for human review.",
             section.heading,

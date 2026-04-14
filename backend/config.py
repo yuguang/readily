@@ -22,7 +22,7 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 LONG_DOC_PAGE_THRESHOLD = int(os.getenv("LONG_DOC_PAGE_THRESHOLD", "20"))
 
 # Parallelization
-MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "32"))
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "8"))
 WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "300"))
 INGEST_MAX_WORKERS = int(os.getenv("INGEST_MAX_WORKERS", "4"))
 
