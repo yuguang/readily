@@ -18,6 +18,9 @@ LITELLM_MODEL_ID = os.getenv("LITELLM_MODEL_ID", "gemini/gemini-2.5-pro")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+# Routing
+LONG_DOC_PAGE_THRESHOLD = int(os.getenv("LONG_DOC_PAGE_THRESHOLD", "20"))
+
 # Parallelization
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "8"))
 WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "60"))
@@ -35,3 +38,8 @@ CONFIDENCE_THRESHOLD = 0.7
 
 # ChromaDB
 COLLECTION_NAME = "policy_documents"
+
+# Compliance extraction (Component 8)
+LONG_DOC_PAGE_THRESHOLD = int(os.getenv("LONG_DOC_PAGE_THRESHOLD", "20"))
+SECTION_MAX_CHARS = 5000          # Max chars per section before sub-splitting
+DEDUP_SIMILARITY_THRESHOLD = 0.90

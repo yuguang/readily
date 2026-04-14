@@ -1,6 +1,7 @@
 from .schemas import (
     AnswerType,
     Requirement,
+    ComplianceRequirement,
     Passage,
     Evaluation,
     ReviewSession,
@@ -14,6 +15,7 @@ from .schemas import (
 __all__ = [
     "AnswerType",
     "Requirement",
+    "ComplianceRequirement",
     "Passage",
     "Evaluation",
     "ReviewSession",

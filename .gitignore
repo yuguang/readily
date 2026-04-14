@@ -3,6 +3,9 @@ data/
 uploads/
 logs/
 
+# zip files
+*.zip
+
 # Python
 __pycache__/
 *.py[cod]

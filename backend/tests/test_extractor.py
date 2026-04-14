@@ -369,61 +369,68 @@ class TestParseRequirements:
 
 
 # ===========================================================================
-# classify_and_extract router — unit tests (mock LLM)
+# classify_and_extract router — async unit tests (mock LLM / Component 8)
 # ===========================================================================
 
 
 class TestClassifyAndExtractRouter:
     """
     Router tests that do NOT make real LLM calls.
-    The narrative extractor is mocked so tests run offline.
+    The narrative and compliance extractors are mocked so tests run offline.
     """
 
-    def test_routes_easy_pdf_to_structured(self):
+    @pytest.mark.anyio
+    async def test_routes_easy_pdf_to_structured(self):
+        """Easy PDF (14 pages, 64 numbered questions) → structured."""
         from backend.agents.extractor import classify_and_extract
 
-        doc_type, reqs = classify_and_extract(str(EASY_PDF))
+        doc_type, reqs = await classify_and_extract(str(EASY_PDF))
         assert doc_type == "structured"
         assert len(reqs) == 64
 
-    def test_routes_hard_pdf_to_narrative(self):
-        """Hard PDF has no structured questions — should invoke the LLM path."""
+    @pytest.mark.anyio
+    async def test_routes_hard_pdf_to_compliance(self):
+        """Hard PDF (145 pages) → compliance extraction agent (Route 2)."""
         from backend.agents.extractor import classify_and_extract
+        from backend.models.schemas import ComplianceRequirement
 
         mock_reqs = [
-            Requirement(id=1, text="Does the P&P state X?", reference="Section I", category="ECM"),
-            Requirement(id=2, text="Does the P&P state Y?", reference="Section II", category="ECM"),
+            ComplianceRequirement(id=1, text="Does the P&P state X?", reference="Section I", category="ECM"),
+            ComplianceRequirement(id=2, text="Does the P&P state Y?", reference="Section II", category="ECM"),
         ]
         with patch(
-            "backend.agents.extractor.run_narrative_extractor",
+            "backend.agents.extractor.run_compliance_extractor",
             return_value=mock_reqs,
         ) as mock_fn:
-            doc_type, reqs = classify_and_extract(str(HARD_PDF))
+            doc_type, reqs = await classify_and_extract(str(HARD_PDF))
 
-        assert doc_type == "narrative"
+        assert doc_type == "compliance"
         assert reqs == mock_reqs
-        mock_fn.assert_called_once()
+        mock_fn.assert_called_once_with(str(HARD_PDF))
 
-    def test_empty_pdf_returns_narrative_empty(self, tmp_path):
+    @pytest.mark.anyio
+    async def test_empty_pdf_returns_narrative_empty(self, tmp_path):
         """A PDF whose pages yield no text returns ('narrative', [])."""
         from backend.agents.extractor import classify_and_extract
 
         empty_pdf = tmp_path / "empty.pdf"
-        # Create a minimal valid PDF with no text
         doc = fitz.open()
         doc.new_page()
         doc.save(str(empty_pdf))
         doc.close()
 
-        with patch("backend.agents.extractor.run_narrative_extractor") as mock_fn:
-            doc_type, reqs = classify_and_extract(str(empty_pdf))
+        with patch("backend.agents.extractor.run_narrative_extractor") as mock_narrative, \
+             patch("backend.agents.extractor.run_compliance_extractor") as mock_compliance:
+            doc_type, reqs = await classify_and_extract(str(empty_pdf))
 
         assert doc_type == "narrative"
         assert reqs == []
-        mock_fn.assert_not_called()  # short-circuits before calling LLM
+        mock_narrative.assert_not_called()
+        mock_compliance.assert_not_called()
 
-    def test_structured_threshold_is_3(self):
-        """Document with exactly 2 matching questions routes to narrative."""
+    @pytest.mark.anyio
+    async def test_structured_threshold_is_3(self):
+        """Two matching questions (< threshold) routes to narrative, not compliance."""
         from backend.agents.extractor import classify_and_extract
 
         two_questions = (
@@ -434,23 +441,24 @@ class TestClassifyAndExtractRouter:
             "(Reference: APL 99-001, page 2)\n"
             " Yes  No\n"
         )
-        mock_reqs: list[Requirement] = []
 
         with (
             patch("backend.agents.extractor.parse_pdf") as mock_parse,
             patch(
                 "backend.agents.extractor.run_narrative_extractor",
-                return_value=mock_reqs,
+                return_value=[],
             ) as mock_narrative,
         ):
+            # 1 page → below threshold → Route 3 (short narrative)
             mock_parse.return_value = [{"page_number": 1, "text": two_questions}]
-            doc_type, reqs = classify_and_extract("fake.pdf")
+            doc_type, _ = await classify_and_extract("fake.pdf")
 
         assert doc_type == "narrative"
         mock_narrative.assert_called_once()
 
-    def test_structured_threshold_met_skips_llm(self):
-        """Document with 3+ structured questions never calls the LLM."""
+    @pytest.mark.anyio
+    async def test_structured_threshold_met_skips_llm(self):
+        """Three or more structured questions → Route 1, no LLM call."""
         from backend.agents.extractor import classify_and_extract
 
         three_questions = "".join(
@@ -462,10 +470,63 @@ class TestClassifyAndExtractRouter:
         with (
             patch("backend.agents.extractor.parse_pdf") as mock_parse,
             patch("backend.agents.extractor.run_narrative_extractor") as mock_narrative,
+            patch("backend.agents.extractor.run_compliance_extractor") as mock_compliance,
         ):
             mock_parse.return_value = [{"page_number": 1, "text": three_questions}]
-            doc_type, reqs = classify_and_extract("fake.pdf")
+            doc_type, reqs = await classify_and_extract("fake.pdf")
 
         assert doc_type == "structured"
         assert len(reqs) == 3
         mock_narrative.assert_not_called()
+        mock_compliance.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_long_doc_routes_to_compliance(self):
+        """Doc with no structured questions and >20 pages → Route 2 (compliance)."""
+        from backend.agents.extractor import classify_and_extract
+        from backend.models.schemas import ComplianceRequirement
+
+        mock_reqs = [ComplianceRequirement(id=1, text="Does the P&P state Z?")]
+
+        with (
+            patch("backend.agents.extractor.parse_pdf") as mock_parse,
+            patch(
+                "backend.agents.extractor.run_compliance_extractor",
+                return_value=mock_reqs,
+            ) as mock_compliance,
+            patch("backend.agents.extractor.run_narrative_extractor") as mock_narrative,
+        ):
+            # Simulate 21 pages of plain narrative text
+            mock_parse.return_value = [
+                {"page_number": i, "text": f"Narrative page {i}."}
+                for i in range(1, 22)
+            ]
+            doc_type, reqs = await classify_and_extract("long_doc.pdf")
+
+        assert doc_type == "compliance"
+        assert reqs == mock_reqs
+        mock_compliance.assert_called_once_with("long_doc.pdf")
+        mock_narrative.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_boundary_20_pages_routes_to_narrative(self):
+        """A doc with exactly 20 pages (= threshold) → Route 3 (short narrative)."""
+        from backend.agents.extractor import classify_and_extract
+
+        with (
+            patch("backend.agents.extractor.parse_pdf") as mock_parse,
+            patch(
+                "backend.agents.extractor.run_narrative_extractor",
+                return_value=[],
+            ) as mock_narrative,
+            patch("backend.agents.extractor.run_compliance_extractor") as mock_compliance,
+        ):
+            mock_parse.return_value = [
+                {"page_number": i, "text": f"Narrative page {i}."}
+                for i in range(1, 21)  # exactly 20 pages
+            ]
+            doc_type, _ = await classify_and_extract("boundary.pdf")
+
+        assert doc_type == "narrative"
+        mock_narrative.assert_called_once()
+        mock_compliance.assert_not_called()

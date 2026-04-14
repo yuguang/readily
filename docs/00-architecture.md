@@ -12,12 +12,14 @@ React UI (Upload, Review, Approve)
 │  Backend    │  ── GET /review/{id}/results, PATCH /review/{id}/results/{n}
 └──────┬──────┘
        │
-  Phase 1 (one-time)        Phase 2 (per upload)         Phase 3 (parallel)
-  ┌─────────────┐          ┌──────────────┐          ┌─────────────────────┐
-  │  Ingestion  │          │ Requirement  │          │  Parallel Dispatcher│
-  │  Pipeline   │──embed──▶│ Extractor    │──split──▶│  (asyncio semaphore)│
-  │  373 PDFs   │          │ (Routing)    │          └────────┬────────────┘
-  └──────┬──────┘          └──────────────┘       ┌──────────┼──────────┐
+  Phase 1 (one-time)        Phase 2 (per upload)                Phase 3 (parallel)
+  ┌─────────────┐          ┌──────────────────────┐          ┌─────────────────────┐
+  │  Ingestion  │          │  Requirement Router  │          │  Parallel Dispatcher│
+  │  Pipeline   │──embed──▶│  ┌─ Structured (regex)│──split──▶│  (asyncio semaphore)│
+  │  373 PDFs   │          │  ├─ Short Narrative   │          └────────┬────────────┘
+  └──────┬──────┘          │  └─ Long → Compliance │       ┌──────────┼──────────┐
+                           │     Extraction Agent  │       │          │          │
+                           └──────────────────────┘       │          │          │
          ▼                                        ▼          ▼          ▼
   ┌──────────────┐                         ┌──────────┐┌──────────┐┌──────────┐
   │  ChromaDB    │◀── search_policies ────│ Worker 1 ││ Worker 2 ││ Worker N │
@@ -39,11 +41,12 @@ React UI (Upload, Review, Approve)
 |---|-----------|-----|-------|-------------|
 | 1 | Data Models (shared contracts) | [01-data-models.md](01-data-models.md) | — | None (start here) |
 | 2 | Ingestion Pipeline | [02-ingestion-pipeline.md](02-ingestion-pipeline.md) | — | Data Models |
-| 3 | Requirement Extraction | [03-requirement-extraction.md](03-requirement-extraction.md) | — | Data Models |
+| 3 | Requirement Extraction (Router) | [03-requirement-extraction.md](03-requirement-extraction.md) | — | Data Models |
 | 4 | Question Agent + RAG | [04-question-agent.md](04-question-agent.md) | — | Data Models, Ingestion (ChromaDB must be populated) |
 | 5 | Parallel Dispatcher + Critic | [05-parallel-dispatcher.md](05-parallel-dispatcher.md) | — | Data Models, Question Agent |
 | 6 | FastAPI Server | [06-api-server.md](06-api-server.md) | — | All backend components |
 | 7 | React Frontend | [07-react-frontend.md](07-react-frontend.md) | — | API Server (contract only) |
+| 8 | Compliance Extraction Agent | [08-compliance-extraction-agent.md](08-compliance-extraction-agent.md) | — | Data Models, PDF Parser |
 
 ## Parallelizable Work Streams
 
@@ -89,7 +92,7 @@ From `agentic-design-patterns-docs/`:
 | Prompt Chaining | Sequential pipeline per question: expand → retrieve → evaluate |
 | Parallelization | Fan-out all questions to concurrent workers via asyncio |
 | RAG | ChromaDB vector search over 373 policy PDFs |
-| Routing | Classify uploaded doc type → structured vs. narrative extraction |
+| Routing | Three-way classify: structured (regex) vs. short narrative (single LLM) vs. long doc (compliance extraction pipeline) |
 | Reflection | Batch critic verifies low-confidence citations |
 | Tool Use | PDF parsing, vector search, citation evaluation tools |
 | Guardrails | Never fabricate citations; flag low-confidence for human review |

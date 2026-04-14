@@ -1,0 +1,603 @@
+"""
+Tests for Component 8: Compliance Extraction Agent.
+
+Covers:
+- segment_document: heading detection, table accumulation, preamble grouping,
+  empty-section merging, long-section sub-splitting
+- filter_obligation_sections: obligation pattern matching, table pass-through
+- deduplicate_requirements: identical texts collapse, distinct texts kept
+- assemble_hierarchy: parent_id assignment for H3 requirements
+- finalize_requirements: sequential IDs, parent_id conversion
+- _parse_compliance_requirements: JSON/list/error cases
+- extract_table_requirements: column mapping, LLM fallback trigger
+- GetSectionTextTool: interface contract
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from backend.agents.compliance_extractor import (
+    GetSectionTextTool,
+    _parse_compliance_requirements,
+    assemble_hierarchy,
+    deduplicate_requirements,
+    extract_table_requirements,
+    finalize_requirements,
+)
+from backend.models.schemas import ComplianceRequirement
+from backend.tools.document_segmenter import (
+    DocumentSection,
+    OBLIGATION_PATTERNS,
+    filter_obligation_sections,
+    segment_document,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_section(
+    heading: str = "Test Section",
+    level: int = 2,
+    text: str = "The MCP must maintain records.",
+    tables: list[str] | None = None,
+    page_start: int = 1,
+    page_end: int = 1,
+) -> DocumentSection:
+    return DocumentSection(
+        heading=heading,
+        level=level,
+        text=text,
+        tables=tables or [],
+        page_start=page_start,
+        page_end=page_end,
+    )
+
+
+def _make_req(
+    text: str = "Does the P&P state that MCPs must maintain records?",
+    section_heading: str = "Test Section",
+    level: int = 2,
+    obligation_type: str | None = "mandatory",
+    exact_quote: str | None = "The MCP must maintain records.",
+    reference: str | None = "Test Section, page 1",
+) -> ComplianceRequirement:
+    return ComplianceRequirement(
+        id=0,
+        text=text,
+        section_heading=section_heading,
+        obligation_type=obligation_type,
+        exact_quote=exact_quote,
+        reference=reference,
+    )
+
+
+# ===========================================================================
+# segment_document
+# ===========================================================================
+
+
+class TestSegmentDocument:
+    def test_single_heading_section(self):
+        text = "[PAGE 1]\n[HEADING 2] Provider Network Requirements\nThe MCP must maintain a network."
+        sections = segment_document(text)
+        # Preamble (empty) + the heading section
+        content_sections = [s for s in sections if s.text.strip()]
+        assert any(s.heading == "Provider Network Requirements" for s in content_sections)
+        req_section = next(s for s in sections if s.heading == "Provider Network Requirements")
+        assert "must maintain a network" in req_section.text
+
+    def test_preamble_before_first_heading(self):
+        text = "[PAGE 1]\nIntroduction text here.\n[HEADING 1] Section I\nMore text."
+        sections = segment_document(text)
+        preamble = next((s for s in sections if s.heading == "Preamble"), None)
+        assert preamble is not None
+        assert "Introduction text" in preamble.text
+
+    def test_multiple_headings_create_multiple_sections(self):
+        text = (
+            "[PAGE 1]\n"
+            "[HEADING 1] Chapter 1\nChapter 1 body.\n"
+            "[PAGE 2]\n"
+            "[HEADING 2] Section 1.1\nSection 1.1 body.\n"
+            "[HEADING 3] Subsection 1.1.a\nSubsection body."
+        )
+        sections = segment_document(text)
+        headings = [s.heading for s in sections]
+        assert "Chapter 1" in headings
+        assert "Section 1.1" in headings
+        assert "Subsection 1.1.a" in headings
+
+    def test_heading_levels_preserved(self):
+        text = (
+            "[HEADING 1] Top Level\nTop level body text.\n"
+            "[HEADING 2] Second Level\nSecond level body text.\n"
+            "[HEADING 3] Third Level\nThird level body text.\n"
+        )
+        sections = segment_document(text)
+        by_heading = {s.heading: s.level for s in sections}
+        assert by_heading.get("Top Level") == 1
+        assert by_heading.get("Second Level") == 2
+        assert by_heading.get("Third Level") == 3
+
+    def test_page_numbers_tracked(self):
+        text = (
+            "[PAGE 1]\n[HEADING 1] Section A\nText A.\n"
+            "[PAGE 5]\n[HEADING 2] Section B\nText B."
+        )
+        sections = segment_document(text)
+        section_b = next(s for s in sections if s.heading == "Section B")
+        assert section_b.page_start == 5
+
+    def test_table_accumulated_in_section(self):
+        text = (
+            "[PAGE 1]\n"
+            "[HEADING 2] Compliance Controls\n"
+            "Narrative text.\n"
+            "[TABLE]\n"
+            "| Control | Owner | Frequency |\n"
+            "| Training | CO | Annually |\n"
+            "[/TABLE]"
+        )
+        sections = segment_document(text)
+        section = next(s for s in sections if s.heading == "Compliance Controls")
+        assert len(section.tables) == 1
+        assert "Training" in section.tables[0]
+
+    def test_empty_section_merged_into_next(self):
+        text = (
+            "[HEADING 1] Empty Section\n"
+            "[HEADING 2] Content Section\nSome body text here."
+        )
+        sections = segment_document(text)
+        # Empty Section has no text; should not appear as a standalone empty section
+        # It should be merged: Content Section absorbs it
+        empty_sec = next((s for s in sections if s.heading == "Empty Section"), None)
+        # Either empty section is gone or content section absorbed it
+        content_sec = next((s for s in sections if s.heading == "Content Section"), None)
+        assert content_sec is not None
+        assert content_sec.text.strip()
+
+    def test_long_section_sub_split(self):
+        # Create a section with text > SECTION_MAX_CHARS (5000)
+        big_paragraph_a = "A " * 2600  # ~5200 chars
+        big_paragraph_b = "B " * 2600
+        text = f"[HEADING 1] Big Section\n{big_paragraph_a}\n\n{big_paragraph_b}"
+        sections = segment_document(text)
+        big_sections = [s for s in sections if "Big Section" in s.heading]
+        assert len(big_sections) >= 2, "Long section should be sub-split"
+
+    def test_empty_string_returns_preamble_only(self):
+        sections = segment_document("")
+        assert len(sections) == 1
+        assert sections[0].heading == "Preamble"
+
+    def test_no_headings_returns_single_preamble(self):
+        text = "[PAGE 1]\nJust plain text with no headings."
+        sections = segment_document(text)
+        assert len(sections) == 1
+        assert sections[0].heading == "Preamble"
+        assert "plain text" in sections[0].text
+
+
+# ===========================================================================
+# filter_obligation_sections
+# ===========================================================================
+
+
+class TestFilterObligationSections:
+    def test_section_with_must_passes(self):
+        sec = _make_section(text="The MCP must report within 30 days.")
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in kept
+        assert sec not in skipped
+
+    def test_section_with_shall_passes(self):
+        sec = _make_section(text="Providers shall submit claims monthly.")
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in kept
+
+    def test_section_with_prohibited_passes(self):
+        sec = _make_section(text="This action is prohibited under the contract.")
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in kept
+
+    def test_section_with_timeframe_passes(self):
+        sec = _make_section(text="Submit the report within 10 business days.")
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in kept
+
+    def test_section_with_no_obligation_skipped(self):
+        sec = _make_section(text="This document provides background information.")
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec not in kept
+        assert sec in skipped
+
+    def test_table_always_passes(self):
+        sec = _make_section(
+            text="This section has no obligation language.",
+            tables=["| Control | Owner |\n| Training | CO |"],
+        )
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in kept
+
+    def test_empty_section_skipped(self):
+        sec = _make_section(text="", tables=[])
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in skipped
+
+    def test_mixed_sections_split_correctly(self):
+        ob_sec = _make_section(text="MCPs must comply with all requirements.")
+        no_sec = _make_section(heading="Glossary", text="Definitions of terms used.")
+        kept, skipped = filter_obligation_sections([ob_sec, no_sec])
+        assert ob_sec in kept
+        assert no_sec in skipped
+
+    def test_obligation_patterns_case_insensitive(self):
+        sec = _make_section(text="The organization SHALL NOT disclose PHI.")
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in kept
+
+    def test_comply_with_pattern(self):
+        sec = _make_section(text="The MCP shall comply with HIPAA regulations.")
+        kept, skipped = filter_obligation_sections([sec])
+        assert sec in kept
+
+
+# ===========================================================================
+# deduplicate_requirements
+# ===========================================================================
+
+
+class TestDeduplicateRequirements:
+    def test_empty_list_returned_unchanged(self):
+        assert deduplicate_requirements([]) == []
+
+    def test_single_item_returned_unchanged(self):
+        req = _make_req()
+        result = deduplicate_requirements([req])
+        assert result == [req]
+
+    def test_identical_texts_merged_to_one(self):
+        text = "Does the P&P state that MCPs must maintain credentialing records?"
+        req1 = _make_req(text=text, reference="Section III, page 5")
+        req2 = _make_req(text=text, reference="Appendix A, page 45")
+        result = deduplicate_requirements([req1, req2], similarity_threshold=0.90)
+        assert len(result) == 1
+
+    def test_merged_requirement_combines_references(self):
+        text = "Does the P&P state that MCPs must maintain credentialing records?"
+        req1 = _make_req(text=text, reference="Section III, page 5")
+        req2 = _make_req(text=text, reference="Appendix A, page 45")
+        result = deduplicate_requirements([req1, req2], similarity_threshold=0.90)
+        assert "Section III" in result[0].reference
+        assert "Appendix A" in result[0].reference
+
+    def test_distinct_texts_kept_separate(self):
+        req1 = _make_req(text="Does the P&P state that MCPs must provide training annually?")
+        req2 = _make_req(text="Does the P&P state that providers must submit claims within 30 days?")
+        result = deduplicate_requirements([req1, req2], similarity_threshold=0.90)
+        assert len(result) == 2
+
+    def test_canonical_is_most_complete(self):
+        """The requirement with more populated fields should be selected as canonical."""
+        sparse = ComplianceRequirement(
+            id=0,
+            text="Does the P&P state that MCPs must maintain quality standards?",
+            reference="Section V",
+        )
+        rich = ComplianceRequirement(
+            id=0,
+            text="Does the P&P state that MCPs must maintain quality standards?",
+            reference="Section V, page 10",
+            obligation_type="mandatory",
+            actor="MCP",
+            action_required="maintain quality standards",
+            evidence_needed="audit logs",
+            risk_area="Operations",
+        )
+        result = deduplicate_requirements([sparse, rich], similarity_threshold=0.90)
+        assert len(result) == 1
+        assert result[0].actor == "MCP"
+
+    def test_threshold_zero_merges_all(self):
+        """With threshold=0, everything merges into one cluster."""
+        reqs = [_make_req(text=f"Question {i}?") for i in range(5)]
+        result = deduplicate_requirements(reqs, similarity_threshold=0.0)
+        assert len(result) == 1
+
+    def test_threshold_one_keeps_all_distinct(self):
+        """With threshold=1.0, only exact-identical texts merge."""
+        req1 = _make_req(text="Does the P&P state that MCPs must provide training?")
+        req2 = _make_req(text="Does the P&P state that providers must submit timely claims?")
+        result = deduplicate_requirements([req1, req2], similarity_threshold=1.0)
+        assert len(result) == 2
+
+
+# ===========================================================================
+# assemble_hierarchy
+# ===========================================================================
+
+
+class TestAssembleHierarchy:
+    def test_h1_h2_requirements_have_no_parent(self):
+        sections = [
+            _make_section(heading="Chapter 1", level=1),
+            _make_section(heading="Section 1.1", level=2),
+        ]
+        reqs = [
+            _make_req(text="Q1?", section_heading="Chapter 1"),
+            _make_req(text="Q2?", section_heading="Section 1.1"),
+        ]
+        result = assemble_hierarchy(reqs, sections)
+        assert result[0].parent_id is None
+        assert result[1].parent_id is None
+
+    def test_h3_requirement_gets_parent_id(self):
+        sections = [
+            _make_section(heading="Section 1", level=2),
+            _make_section(heading="Section 1.A", level=3),
+        ]
+        reqs = [
+            _make_req(text="Parent Q?", section_heading="Section 1"),
+            _make_req(text="Child Q?", section_heading="Section 1.A"),
+        ]
+        result = assemble_hierarchy(reqs, sections)
+        assert result[0].parent_id is None
+        # Child gets the 0-indexed parent position
+        assert result[1].parent_id == 0
+
+    def test_llm_parent_id_overwritten(self):
+        """Any LLM-provided parent_id is cleared and recomputed."""
+        sections = [_make_section(heading="Section A", level=2)]
+        req = _make_req(section_heading="Section A")
+        req.parent_id = 999  # bogus LLM value
+        result = assemble_hierarchy([req], sections)
+        assert result[0].parent_id is None  # cleared (H2 → no parent)
+
+    def test_unknown_section_treated_as_top_level(self):
+        """Requirements with unknown section_heading get level=0, treated as parent."""
+        sections = [_make_section(heading="Known Section", level=3)]
+        req = _make_req(section_heading="Unknown Section")
+        result = assemble_hierarchy([req], sections)
+        assert result[0].parent_id is None  # level 0 → no parent assigned
+
+
+# ===========================================================================
+# finalize_requirements
+# ===========================================================================
+
+
+class TestFinalizeRequirements:
+    def test_ids_assigned_sequentially_from_1(self):
+        reqs = [_make_req() for _ in range(5)]
+        result = finalize_requirements(reqs)
+        assert [r.id for r in result] == [1, 2, 3, 4, 5]
+
+    def test_parent_id_converted_from_0indexed_to_1indexed(self):
+        reqs = [
+            _make_req(text="Parent?"),
+            _make_req(text="Child?"),
+        ]
+        reqs[1].parent_id = 0  # 0-indexed → should become 1
+        result = finalize_requirements(reqs)
+        assert result[1].parent_id == 1  # 1-indexed
+
+    def test_none_parent_id_unchanged(self):
+        reqs = [_make_req()]
+        reqs[0].parent_id = None
+        result = finalize_requirements(reqs)
+        assert result[0].parent_id is None
+
+    def test_empty_list_returns_empty(self):
+        assert finalize_requirements([]) == []
+
+
+# ===========================================================================
+# _parse_compliance_requirements
+# ===========================================================================
+
+
+class TestParseComplianceRequirements:
+    def _section(self) -> DocumentSection:
+        return _make_section()
+
+    def _item(self, **overrides) -> dict:
+        base = {
+            "text": "Does the P&P state that MCPs must train staff?",
+            "exact_quote": "MCPs must train all staff annually.",
+            "reference": "Section IV, page 12",
+            "category": "Training",
+            "obligation_type": "mandatory",
+            "obligation_level": "mandatory",
+            "actor": "MCP",
+            "action_required": "train staff",
+            "condition": None,
+            "timeframe": "annually",
+            "evidence_needed": "training records",
+            "risk_area": "Operations",
+        }
+        base.update(overrides)
+        return base
+
+    def test_parses_list_of_dicts(self):
+        data = [self._item()]
+        result = _parse_compliance_requirements(data, self._section())
+        assert len(result) == 1
+        assert result[0].text == "Does the P&P state that MCPs must train staff?"
+
+    def test_parses_json_string(self):
+        data = json.dumps([self._item()])
+        result = _parse_compliance_requirements(data, self._section())
+        assert len(result) == 1
+
+    def test_parses_markdown_fenced_json(self):
+        inner = json.dumps([self._item()])
+        fenced = f"```json\n{inner}\n```"
+        result = _parse_compliance_requirements(fenced, self._section())
+        assert len(result) == 1
+
+    def test_extracts_array_from_prose(self):
+        inner = json.dumps([self._item()])
+        wrapped = f"Here are the requirements:\n{inner}\nEnd."
+        result = _parse_compliance_requirements(wrapped, self._section())
+        assert len(result) == 1
+
+    def test_injects_placeholder_id(self):
+        """The parser should always set id=0 regardless of LLM output."""
+        item = self._item()
+        item["id"] = 99  # LLM might return an id
+        result = _parse_compliance_requirements([item], self._section())
+        assert result[0].id == 0
+
+    def test_clears_llm_parent_id(self):
+        item = self._item()
+        item["parent_id"] = 5  # LLM-provided parent
+        result = _parse_compliance_requirements([item], self._section())
+        assert result[0].parent_id is None
+
+    def test_sets_section_heading_from_section(self):
+        item = self._item()
+        section = _make_section(heading="Provider Network")
+        result = _parse_compliance_requirements([item], section)
+        assert result[0].section_heading == "Provider Network"
+
+    def test_section_heading_from_item_not_overwritten_if_present(self):
+        """section_heading from item is preserved if already set."""
+        item = self._item()
+        item["section_heading"] = "Custom Heading"
+        result = _parse_compliance_requirements([item], self._section())
+        assert result[0].section_heading == "Custom Heading"
+
+    def test_invalid_json_returns_empty_list(self):
+        result = _parse_compliance_requirements("{{{not json", self._section())
+        assert result == []
+
+    def test_non_array_json_returns_empty_list(self):
+        result = _parse_compliance_requirements('{"text": "Q?"}', self._section())
+        assert result == []
+
+    def test_skips_malformed_items(self):
+        """Items that fail validation are skipped; valid ones are returned."""
+        items = [self._item(), {"bad": "no text field"}]
+        result = _parse_compliance_requirements(items, self._section())
+        assert len(result) == 1  # only the valid item
+
+    def test_empty_list_returns_empty(self):
+        result = _parse_compliance_requirements([], self._section())
+        assert result == []
+
+    def test_optional_fields_populated(self):
+        item = self._item()
+        result = _parse_compliance_requirements([item], self._section())
+        r = result[0]
+        assert r.obligation_type == "mandatory"
+        assert r.actor == "MCP"
+        assert r.timeframe == "annually"
+        assert r.evidence_needed == "training records"
+        assert r.risk_area == "Operations"
+
+
+# ===========================================================================
+# GetSectionTextTool
+# ===========================================================================
+
+
+class TestGetSectionTextTool:
+    def test_interface_contract(self):
+        section = _make_section()
+        tool = GetSectionTextTool(section)
+        assert tool.name == "get_section_text"
+        assert tool.description
+        assert tool.inputs == {}
+        assert tool.output_type == "string"
+
+    def test_returns_section_content(self):
+        section = _make_section(
+            heading="Provider Network Requirements",
+            text="The MCP must maintain a network.",
+            page_start=3,
+            page_end=5,
+        )
+        tool = GetSectionTextTool(section)
+        output = tool()
+        assert "Provider Network Requirements" in output
+        assert "The MCP must maintain a network." in output
+        assert "3" in output  # page range
+
+    def test_tables_included_in_output(self):
+        section = _make_section(
+            text="Body text.",
+            tables=["| Control | Owner |\n| Training | CO |"],
+        )
+        tool = GetSectionTextTool(section)
+        output = tool()
+        assert "Training" in output
+        assert "[TABLE 1]" in output
+        assert "[/TABLE 1]" in output
+
+    def test_empty_section_text(self):
+        section = _make_section(text="", tables=[])
+        tool = GetSectionTextTool(section)
+        output = tool()
+        assert isinstance(output, str)
+
+
+# ===========================================================================
+# extract_table_requirements
+# ===========================================================================
+
+
+class TestExtractTableRequirements:
+    def test_known_column_headers_mapped(self):
+        table = (
+            "| Requirement | Responsible Party | Deadline |\n"
+            "| Annual training | Compliance Officer | Q1 each year |"
+        )
+        result = extract_table_requirements(table, "Section III", 5)
+        assert len(result) == 1
+        req = result[0]
+        assert "Annual training" in req.text
+        assert req.actor == "Compliance Officer"
+        assert req.timeframe == "Q1 each year"
+
+    def test_multiple_rows_produce_multiple_requirements(self):
+        table = (
+            "| Requirement | Responsible Party |\n"
+            "| Training completed | CO |\n"
+            "| Records maintained | Records Manager |"
+        )
+        result = extract_table_requirements(table, "Section IV", 10)
+        assert len(result) == 2
+
+    def test_reference_set_correctly(self):
+        table = (
+            "| Requirement |\n"
+            "| Submit reports |"
+        )
+        result = extract_table_requirements(table, "Appendix A", 99)
+        assert len(result) == 1
+        assert "Appendix A" in result[0].reference
+        assert "99" in result[0].reference
+
+    def test_empty_table_returns_empty(self):
+        result = extract_table_requirements("", "Section I", 1)
+        assert result == []
+
+    def test_unknown_headers_trigger_llm_fallback(self):
+        """When column headers are unrecognizable, fall back to run_section_extractor."""
+        table = "| Alpha | Beta | Gamma |\n| x | y | z |"
+        mock_reqs = [_make_req()]
+        with patch(
+            "backend.agents.compliance_extractor.run_section_extractor",
+            return_value=mock_reqs,
+        ) as mock_fn:
+            result = extract_table_requirements(table, "Unknown Table", 1)
+        mock_fn.assert_called_once()
+        assert result == mock_reqs

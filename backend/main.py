@@ -118,7 +118,7 @@ async def upload_pdf(file: UploadFile) -> UploadResponse:
     pdf_path.write_bytes(contents)
 
     try:
-        doc_type, requirements = classify_and_extract(str(pdf_path))
+        doc_type, requirements = await classify_and_extract(str(pdf_path))
     except Exception as exc:
         pdf_path.unlink(missing_ok=True)
         logger.error("Failed to extract requirements from %s: %s", file.filename, exc)

@@ -16,12 +16,8 @@ from typing import Any
 from pydantic import ValidationError
 from smolagents import OpenAIModel, Tool, ToolCallingAgent
 
-from backend.config import GEMINI_API_KEY
+from backend.config import GEMINI_API_BASE, GEMINI_API_KEY, LLM_MODEL_ID
 from backend.models.schemas import Requirement
-
-# Gemini OpenAI-compatible endpoint
-_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
-_GEMINI_MODEL_ID = "gemini-2.5-pro"
 
 logger = logging.getLogger(__name__)
 
@@ -180,9 +176,9 @@ def run_narrative_extractor(full_text: str) -> list[Requirement]:
     parse_pdf_tool = GetDocumentTextTool(full_text)
 
     model = OpenAIModel(
-        model_id=_GEMINI_MODEL_ID,
+        model_id=LLM_MODEL_ID,
         api_key=GEMINI_API_KEY,
-        api_base=_GEMINI_API_BASE,
+        api_base=GEMINI_API_BASE,
         temperature=0.2,
     )
 

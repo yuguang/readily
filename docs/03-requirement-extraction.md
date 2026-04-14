@@ -8,7 +8,7 @@
 Parse an uploaded regulatory PDF and extract a list of `Requirement` objects. This runs once per upload and feeds into the parallel dispatcher (Component 5).
 
 ## Routing Pattern
-The extractor uses a **routing** strategy to handle two document types:
+The extractor uses a **three-way routing** strategy based on document type and length:
 
 ### Structured Forms (Easy)
 Documents like the DHCS Submission Review Form with explicit numbered questions.
@@ -35,12 +35,12 @@ def parse_review_form(pdf_text: str) -> list[Requirement]:
 - The `(Reference: APL 25-008, page X)` always follows the question text
 - Questions 1-64 in the Easy example; count may vary for other APLs
 
-### Narrative Documents (Hard)
-Regulatory documents written as prose where requirements are implicit.
+### Short Narrative Documents (≤20 pages)
+Short regulatory documents written as prose where requirements are implicit but the full text fits in a single LLM context window.
 
-**Detection heuristic**: No numbered question pattern found. Text reads as continuous paragraphs.
+**Detection heuristic**: No numbered question pattern found AND page count ≤ `LONG_DOC_PAGE_THRESHOLD` (default 20).
 
-**Extraction method**: LLM-based via smolagents `ToolCallingAgent`.
+**Extraction method**: Single-pass LLM via smolagents `ToolCallingAgent`.
 
 ```python
 import os
@@ -72,18 +72,35 @@ narrative_extractor = ToolCallingAgent(
 )
 ```
 
+### Long Narrative Documents (>20 pages) — Compliance Extraction Agent
+Long regulatory PDFs (e.g. 145-page DHCS policy guides) where a single LLM call loses detail, can't handle tables, and misses conditional logic buried deep in the document.
+
+**Detection heuristic**: No numbered question pattern found AND page count > `LONG_DOC_PAGE_THRESHOLD`.
+
+**Extraction method**: Multi-step pipeline (Component 8) that segments the document by section, filters for obligation language, extracts per-section in parallel, deduplicates, and assembles a requirement hierarchy. Produces enriched `ComplianceRequirement` objects with fields for obligation type, actor, condition, timeframe, and evidence needed.
+
+See [08-compliance-extraction-agent.md](08-compliance-extraction-agent.md) for full design.
+
 ## Router Logic
 ```python
+from backend.config import LONG_DOC_PAGE_THRESHOLD
+
 def classify_and_extract(pdf_path: str) -> tuple[str, list[Requirement]]:
     pages = parse_pdf(pdf_path)
     full_text = "\n".join(p["text"] for p in pages)
+    page_count = len(pages)
 
-    # Try structured extraction first
+    # Route 1: Try structured extraction first
     requirements = parse_review_form(full_text)
-    if len(requirements) >= 3:  # At least 3 numbered questions found
+    if len(requirements) >= 3:
         return "structured", requirements
 
-    # Fall back to narrative extraction
+    # Route 2: Long docs → compliance extraction agent (section-by-section pipeline)
+    if page_count > LONG_DOC_PAGE_THRESHOLD:
+        requirements = await run_compliance_extractor(pdf_path)
+        return "compliance", requirements
+
+    # Route 3: Short narrative → single-pass LLM extraction
     requirements = run_narrative_extractor(full_text)
     return "narrative", requirements
 ```
@@ -92,7 +109,8 @@ def classify_and_extract(pdf_path: str) -> tuple[str, list[Requirement]]:
 A list of `Requirement` objects (see Component 1) returned to the API server, which stores them in the `ReviewSession` and sends them to the frontend for user confirmation.
 
 ## Testing
-- **Structured**: Parse `data/Example Input Doc - Easy.pdf` → expect exactly 64 requirements, spot-check questions 1, 18, 40, 64
-- **Narrative**: Parse `data/Example Input Doc - Hard.pdf` → verify reasonable requirement count, each has text + reference
-- **Router**: Verify correct routing for both doc types
-- **Edge cases**: PDF with no extractable text, PDF with mixed structured/narrative sections
+- **Structured**: Parse `data/Example Input Doc - Easy.pdf` (14 pages) → expect exactly 64 requirements, spot-check questions 1, 18, 40, 64
+- **Short narrative**: A ≤20-page narrative PDF → verify the simple extractor is used, returns requirements with text + reference
+- **Long narrative**: Parse `data/Example Input Doc - Hard.pdf` (145 pages) → verify compliance extraction agent is used, returns enriched `ComplianceRequirement` objects
+- **Router**: Verify correct three-way routing: structured (regex hits), short narrative (≤20 pages), long narrative (>20 pages)
+- **Edge cases**: PDF with no extractable text, PDF with mixed structured/narrative sections, PDF at exactly 20 pages (boundary)

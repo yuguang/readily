@@ -20,6 +20,24 @@ class Requirement(BaseModel):
     category: str | None = None      # Optional grouping (for narrative docs)
 ```
 
+### `ComplianceRequirement` (extends `Requirement`)
+Enriched requirement produced by the compliance extraction agent (Component 8) for long regulatory documents. All extra fields are optional so this is fully backward-compatible — structured and short-narrative extractors continue to produce base `Requirement` objects.
+
+```python
+class ComplianceRequirement(Requirement):
+    obligation_type: str | None = None      # "mandatory" | "prohibition" | "conditional" | "recommended"
+    obligation_level: str | None = None     # "mandatory" | "conditional_mandatory" | "recommended" | "informational"
+    actor: str | None = None                # Who must act: "MCP", "Compliance Officer", "Provider"
+    action_required: str | None = None      # What must be done (verb phrase)
+    condition: str | None = None            # Trigger: "if PHI is involved", "upon detection"
+    timeframe: str | None = None            # "within 30 days", "annually", "quarterly"
+    evidence_needed: str | None = None      # What proves compliance: "training records", "audit logs"
+    risk_area: str | None = None            # "Privacy", "Security", "Financial", "Operations"
+    parent_id: int | None = None            # Links sub-requirements to their parent
+    exact_quote: str | None = None          # Verbatim text from the source document
+    section_heading: str | None = None      # Heading of the source section
+```
+
 ### `Passage`
 A chunk retrieved from the policy vector store.
 

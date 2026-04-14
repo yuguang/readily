@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from backend.models.schemas import (
     AnswerType,
     BulkApproveRequest,
+    ComplianceRequirement,
     Evaluation,
     Passage,
     Requirement,
@@ -102,6 +103,68 @@ class TestRequirement:
     def test_roundtrip(self):
         r = Requirement(id=1, text="Q?", reference="ref", category="cat")
         assert Requirement.model_validate(json.loads(r.model_dump_json())) == r
+
+
+# ---------------------------------------------------------------------------
+# ComplianceRequirement
+# ---------------------------------------------------------------------------
+
+
+class TestComplianceRequirement:
+    def test_is_requirement_subclass(self):
+        cr = ComplianceRequirement(id=1, text="Q?")
+        assert isinstance(cr, Requirement)
+
+    def test_all_optional_fields_default_to_none(self):
+        cr = ComplianceRequirement(id=1, text="Q?")
+        for field in (
+            "obligation_type", "obligation_level", "actor", "action_required",
+            "condition", "timeframe", "evidence_needed", "risk_area",
+            "parent_id", "exact_quote", "section_heading",
+        ):
+            assert getattr(cr, field) is None
+
+    def test_inherits_base_fields(self):
+        cr = ComplianceRequirement(id=2, text="Q?", reference="APL 1", category="Privacy")
+        assert cr.reference == "APL 1"
+        assert cr.category == "Privacy"
+
+    def test_full_fields(self):
+        cr = ComplianceRequirement(
+            id=3,
+            text="Does the P&P state that…",
+            obligation_type="mandatory",
+            obligation_level="conditional_mandatory",
+            actor="Compliance Officer",
+            action_required="submit annual report",
+            condition="if PHI is involved",
+            timeframe="within 30 days",
+            evidence_needed="audit logs",
+            risk_area="Privacy",
+            parent_id=1,
+            exact_quote="The plan shall…",
+            section_heading="Section 4.2",
+        )
+        assert cr.obligation_type == "mandatory"
+        assert cr.parent_id == 1
+        assert cr.risk_area == "Privacy"
+
+    def test_roundtrip(self):
+        cr = ComplianceRequirement(
+            id=1,
+            text="Q?",
+            obligation_type="prohibition",
+            actor="MCP",
+            timeframe="annually",
+        )
+        assert ComplianceRequirement.model_validate(json.loads(cr.model_dump_json())) == cr
+
+    def test_backward_compatible_with_base_fields_only(self):
+        """A plain Requirement dict can be validated as ComplianceRequirement."""
+        data = {"id": 1, "text": "Q?", "reference": None, "category": None}
+        cr = ComplianceRequirement.model_validate(data)
+        assert cr.id == 1
+        assert cr.obligation_type is None
 
 
 # ---------------------------------------------------------------------------
