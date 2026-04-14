@@ -30,6 +30,7 @@ Public API
 
 from __future__ import annotations
 
+import math
 import re
 import logging
 from dataclasses import dataclass, field
@@ -197,7 +198,7 @@ def build_header_footer_filter(
         logger.debug("Document has <2 pages; skipping header/footer detection.")
         return HeaderFooterFilter()
 
-    min_pages = max(min_pages_absolute, int(n_pages * min_page_fraction))
+    min_pages = max(min_pages_absolute, math.ceil(n_pages * min_page_fraction))
 
     # sig -> set of page indices where it was seen
     sig_page_sets: dict[str, set[int]] = {}
