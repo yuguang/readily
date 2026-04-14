@@ -71,3 +71,7 @@ export async function exportCsv(sessionId: string): Promise<Blob> {
 export function getStreamUrl(sessionId: string): string {
   return `${API_BASE}/review/${sessionId}/stream`;
 }
+
+export function getExtractionStreamUrl(sessionId: string): string {
+  return `${API_BASE}/upload/${sessionId}/extraction-stream`;
+}

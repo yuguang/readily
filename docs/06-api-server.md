@@ -28,9 +28,61 @@ Upload a regulatory PDF and extract requirements.
 
 **Flow**:
 1. Save uploaded file to `uploads/{session_id}.pdf`
-2. Call `classify_and_extract(pdf_path)` (Component 3)
-3. Create a `ReviewSession` and store in memory (dict keyed by session_id)
-4. Return requirements for frontend confirmation
+2. Parse PDF and classify doc type (fast — regex detection only)
+3. **Structured / short narrative**: extract requirements synchronously, return full `UploadResponse`
+4. **Long narrative (>20 pages)**: return immediately with `extraction_status: "processing"` and empty `requirements` list. Extraction runs async; the frontend connects to the extraction SSE stream.
+
+**Response variants**:
+- Fast path (structured/short): `{ session_id, filename, doc_type, extraction_status: "complete", requirements: [...] }`
+- Slow path (long): `{ session_id, filename, doc_type: "compliance", extraction_status: "processing", requirements: [] }`
+
+### `GET /upload/{session_id}/extraction-stream`
+SSE endpoint — streams progress of the compliance extraction pipeline for long documents.
+
+**Response**: `text/event-stream`
+```
+event: extraction_progress
+data: {"step": "parsing", "step_number": 1, "total_steps": 7, "detail": "Parsing PDF structure..."}
+
+event: extraction_progress
+data: {"step": "segmenting", "step_number": 2, "total_steps": 7, "detail": "Found 52 sections"}
+
+event: extraction_progress
+data: {"step": "filtering", "step_number": 3, "total_steps": 7, "detail": "28 of 52 sections contain obligation language"}
+
+event: extraction_progress
+data: {"step": "extracting", "step_number": 4, "total_steps": 7, "sections_completed": 12, "sections_total": 28, "detail": "Extracting requirements from sections..."}
+
+event: extraction_progress
+data: {"step": "deduplicating", "step_number": 5, "total_steps": 7, "detail": "Deduplicating 87 → 62 requirements"}
+
+event: extraction_progress
+data: {"step": "hierarchy", "step_number": 6, "total_steps": 7, "detail": "Assembling requirement hierarchy"}
+
+event: extraction_progress
+data: {"step": "finalizing", "step_number": 7, "total_steps": 7, "detail": "Assigning IDs"}
+
+event: extraction_complete
+data: {"requirements": [...], "total_requirements": 62}
+```
+
+**Implementation**:
+```python
+@app.get("/upload/{session_id}/extraction-stream")
+async def stream_extraction_progress(session_id: str):
+    session = sessions[session_id]
+
+    async def event_generator():
+        async for progress in run_compliance_extractor_with_progress(session.pdf_path):
+            if progress["type"] == "progress":
+                yield {"event": "extraction_progress", "data": json.dumps(progress)}
+            elif progress["type"] == "complete":
+                session.requirements = [Requirement(**r) for r in progress["requirements"]]
+                session.status = "extracting"  # ready for review
+                yield {"event": "extraction_complete", "data": json.dumps(progress)}
+
+    return EventSourceResponse(event_generator())
+```
 
 ### `POST /review/{session_id}/start`
 Start the parallel review for a session.

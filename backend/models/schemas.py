@@ -122,7 +122,8 @@ class UploadResponse(BaseModel):
     session_id: str
     filename: str
     doc_type: str
-    requirements: list[Requirement]
+    extraction_status: Literal["complete", "processing"] = "complete"  # "processing" for long docs
+    requirements: list[Requirement]  # Empty list when extraction_status="processing"
 
 
 class StartReviewRequest(BaseModel):

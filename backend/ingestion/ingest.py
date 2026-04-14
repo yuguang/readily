@@ -1,8 +1,15 @@
-"""Bulk ingestion orchestrator: parse → chunk → upsert into ChromaDB."""
+"""Bulk ingestion orchestrator: parse → chunk → upsert into ChromaDB.
+
+PDF parsing and chunking run concurrently via a ThreadPoolExecutor
+(controlled by INGEST_MAX_WORKERS).  ChromaDB upserts remain sequential
+to avoid write contention on the underlying SQLite store.
+"""
 
 import argparse
 import logging
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict
 
@@ -18,6 +25,7 @@ from backend.config import (
     CHUNK_SIZE,
     COLLECTION_NAME,
     EMBEDDING_MODEL,
+    INGEST_MAX_WORKERS,
     POLICIES_DIR,
 )
 from backend.ingestion.chunker import chunk_document
@@ -27,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 # ChromaDB upsert batch size — keeps memory usage predictable
 _UPSERT_BATCH = 100
+
+# Serialise console output from concurrent workers
+_print_lock = threading.Lock()
 
 
 def _get_collection(chroma_dir: str) -> chromadb.Collection:
@@ -40,9 +51,47 @@ def _get_collection(chroma_dir: str) -> chromadb.Collection:
     )
 
 
+def _parse_and_chunk(
+    folder_name: str, pdf_path: Path
+) -> tuple[str, list[dict] | None, str | None]:
+    """Parse one PDF and return its chunks.
+
+    Returns ``(source_file, chunks, error_message)``.
+    *chunks* is ``None`` when an error or empty-document condition occurs.
+    Thread-safe: reads only from the filesystem, no shared mutable state.
+    """
+    source_file = f"{folder_name}/{pdf_path.name}"
+    with _print_lock:
+        print(f"  [{folder_name}] {pdf_path.name}", flush=True)
+
+    try:
+        pages = parse_pdf(str(pdf_path))
+        if not pages:
+            return source_file, None, f"No extractable text in {source_file} (skipped)"
+
+        chunks = chunk_document(
+            pages,
+            source_file=source_file,
+            chunk_size=CHUNK_SIZE,
+            overlap=CHUNK_OVERLAP,
+        )
+        if not chunks:
+            return source_file, None, f"No chunks generated from {source_file} (skipped)"
+
+        return source_file, chunks, None
+
+    except Exception as exc:  # pragma: no cover
+        msg = f"Error processing {source_file}: {exc}"
+        logger.error(msg, exc_info=True)
+        return source_file, None, msg
+
+
 def ingest_all_policies(policies_dir: str, chroma_dir: str) -> Dict:
     """
     Walk *policies_dir*, parse every PDF, chunk it, and upsert into ChromaDB.
+
+    PDF parsing and chunking run concurrently (``INGEST_MAX_WORKERS`` threads).
+    ChromaDB upserts remain sequential to avoid write contention.
 
     Returns a stats dict::
 
@@ -59,63 +108,54 @@ def ingest_all_policies(policies_dir: str, chroma_dir: str) -> Dict:
     if not policies_path.is_dir():
         raise FileNotFoundError(f"Policies directory not found: {policies_dir}")
 
-    folder_dirs = sorted(p for p in policies_path.iterdir() if p.is_dir())
+    # Collect all (folder_name, pdf_path) tasks up front
+    tasks: list[tuple[str, Path]] = [
+        (folder_path.name, pdf_path)
+        for folder_path in sorted(p for p in policies_path.iterdir() if p.is_dir())
+        for pdf_path in sorted(folder_path.glob("*.pdf"))
+    ]
 
-    for folder_path in folder_dirs:
-        folder_name = folder_path.name
-        pdf_files = sorted(folder_path.glob("*.pdf"))
+    if not tasks:
+        return stats
 
-        for pdf_path in pdf_files:
-            source_file = f"{folder_name}/{pdf_path.name}"
-            print(f"  [{folder_name}] {pdf_path.name}", flush=True)
+    # ── Parallel parse + chunk ──────────────────────────────────────────────
+    with ThreadPoolExecutor(max_workers=INGEST_MAX_WORKERS) as executor:
+        future_to_task = {
+            executor.submit(_parse_and_chunk, folder_name, pdf_path): (folder_name, pdf_path)
+            for folder_name, pdf_path in tasks
+        }
 
-            try:
-                pages = parse_pdf(str(pdf_path))
-                if not pages:
-                    msg = f"No extractable text in {source_file} (skipped)"
-                    logger.warning(msg)
-                    stats["errors"].append(msg)
-                    continue
+        for future in as_completed(future_to_task):
+            source_file, chunks, error = future.result()
 
-                chunks = chunk_document(
-                    pages,
-                    source_file=source_file,
-                    chunk_size=CHUNK_SIZE,
-                    overlap=CHUNK_OVERLAP,
+            if error:
+                is_hard_error = error.startswith("Error processing")
+                (logger.error if is_hard_error else logger.warning)(error)
+                stats["errors"].append(error)
+                continue
+
+            # ── Sequential upsert (thread-safe w.r.t. ChromaDB) ────────────
+            for batch_start in range(0, len(chunks), _UPSERT_BATCH):
+                batch = chunks[batch_start : batch_start + _UPSERT_BATCH]
+                collection.upsert(
+                    ids=[
+                        f"{c['source_file']}::{c['chunk_index']}"
+                        for c in batch
+                    ],
+                    documents=[c["text"] for c in batch],
+                    metadatas=[
+                        {
+                            "source_file": c["source_file"],
+                            "folder": c["folder"],
+                            "page_number": c["page_number"],
+                            "chunk_index": c["chunk_index"],
+                        }
+                        for c in batch
+                    ],
                 )
-                if not chunks:
-                    msg = f"No chunks generated from {source_file} (skipped)"
-                    logger.warning(msg)
-                    stats["errors"].append(msg)
-                    continue
 
-                # Upsert in batches (ID = source_file::chunk_index for idempotency)
-                for batch_start in range(0, len(chunks), _UPSERT_BATCH):
-                    batch = chunks[batch_start : batch_start + _UPSERT_BATCH]
-                    collection.upsert(
-                        ids=[
-                            f"{c['source_file']}::{c['chunk_index']}"
-                            for c in batch
-                        ],
-                        documents=[c["text"] for c in batch],
-                        metadatas=[
-                            {
-                                "source_file": c["source_file"],
-                                "folder": c["folder"],
-                                "page_number": c["page_number"],
-                                "chunk_index": c["chunk_index"],
-                            }
-                            for c in batch
-                        ],
-                    )
-
-                stats["total_files"] += 1
-                stats["total_chunks"] += len(chunks)
-
-            except Exception as exc:
-                msg = f"Error processing {source_file}: {exc}"
-                logger.error(msg, exc_info=True)
-                stats["errors"].append(msg)
+            stats["total_files"] += 1
+            stats["total_chunks"] += len(chunks)
 
     return stats
 

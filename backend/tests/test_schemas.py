@@ -390,20 +390,45 @@ class TestSSEEvent:
 
 
 class TestUploadResponse:
-    def test_valid(self):
+    def test_complete_status(self):
         r = UploadResponse(
             session_id="s1",
             filename="f.pdf",
             doc_type="structured",
+            extraction_status="complete",
             requirements=[make_requirement(1)],
         )
-        assert r.session_id == "s1"
+        assert r.extraction_status == "complete"
+        assert len(r.requirements) == 1
+
+    def test_processing_status_with_empty_requirements(self):
+        """Long docs may return processing status with no requirements yet."""
+        r = UploadResponse(
+            session_id="s2",
+            filename="long.pdf",
+            doc_type="narrative",
+            extraction_status="processing",
+            requirements=[],
+        )
+        assert r.extraction_status == "processing"
+        assert r.requirements == []
+
+    def test_invalid_extraction_status_raises(self):
+        with pytest.raises(ValidationError):
+            UploadResponse(
+                session_id="s1",
+                filename="f.pdf",
+                doc_type="structured",
+                extraction_status="unknown",
+                requirements=[],
+            )
 
     def test_roundtrip(self):
         r = UploadResponse(
             session_id="s1",
             filename="f.pdf",
             doc_type="narrative",
+            extraction_status="complete",
             requirements=[make_requirement(1)],
         )
         assert UploadResponse.model_validate(json.loads(r.model_dump_json())) == r

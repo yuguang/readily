@@ -1,9 +1,111 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { uploadDocument } from '../api/client';
+import { useExtractionProgress } from '../hooks/useExtractionProgress';
 import { mockUploadResponse } from '../mocks/mockData';
-import type { UploadResponse } from '../types';
+import type { Requirement, UploadResponse } from '../types';
 
 const USE_MOCK = import.meta.env.VITE_MOCK === 'true';
+
+// Pipeline step descriptors — match the SSE `step` field values from the backend.
+const PIPELINE_STEPS: { key: string; label: string }[] = [
+  { key: 'parsing', label: 'Parse' },
+  { key: 'segmenting', label: 'Segment' },
+  { key: 'filtering', label: 'Filter' },
+  { key: 'extracting', label: 'Extract' },
+  { key: 'deduplicating', label: 'Dedup' },
+  { key: 'hierarchy', label: 'Hier.' },
+  { key: 'finalizing', label: 'Done' },
+];
+
+// ── Extraction progress panel ─────────────────────────────────────────────────
+
+interface ExtractionProgressProps {
+  filename: string;
+  sessionId: string;
+  onComplete: (requirements: Requirement[]) => void;
+  onError: (message: string) => void;
+}
+
+function ExtractionProgress({ filename, sessionId, onComplete, onError }: ExtractionProgressProps) {
+  const { currentStep, requirements, error } = useExtractionProgress(sessionId);
+
+  useEffect(() => {
+    if (requirements) onComplete(requirements);
+  }, [requirements, onComplete]);
+
+  useEffect(() => {
+    if (error) onError(error);
+  }, [error, onError]);
+
+  const stepNum = currentStep?.step_number ?? 0;
+  const totalSteps = currentStep?.total_steps ?? PIPELINE_STEPS.length;
+  const activeKey = currentStep?.step ?? '';
+
+  return (
+    <div className="flex flex-col gap-5">
+      {/* File name + current step detail */}
+      <div className="text-center">
+        <p className="font-semibold text-gray-800 truncate">{filename}</p>
+        <p className="mt-1 text-sm text-blue-600 font-medium">
+          {currentStep
+            ? `Step ${stepNum} of ${totalSteps}: ${currentStep.detail}`
+            : 'Starting extraction…'}
+        </p>
+      </div>
+
+      {/* Section-level sub-progress (only shown during the extraction step) */}
+      {currentStep?.sections_total != null && currentStep.sections_total > 0 && (
+        <div>
+          <div className="flex justify-between text-xs text-gray-400 mb-1">
+            <span>Extracting requirements</span>
+            <span>
+              {currentStep.sections_completed ?? 0} / {currentStep.sections_total} sections
+            </span>
+          </div>
+          <div className="w-full bg-gray-200 rounded-full h-2">
+            <div
+              className="h-2 bg-blue-500 rounded-full transition-all duration-300"
+              style={{
+                width: `${Math.round(
+                  ((currentStep.sections_completed ?? 0) / currentStep.sections_total) * 100,
+                )}%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Pipeline step indicators */}
+      <div className="flex items-end justify-center gap-2">
+        {PIPELINE_STEPS.map((s, i) => {
+          const stepIndex = i + 1;
+          const isDone = stepIndex < stepNum;
+          const isActive = s.key === activeKey;
+          return (
+            <div key={s.key} className="flex flex-col items-center gap-1.5">
+              <div
+                className={`w-9 h-9 rounded-lg border-2 flex items-center justify-center text-sm font-bold transition-all ${
+                  isDone
+                    ? 'border-green-500 bg-green-50 text-green-600'
+                    : isActive
+                      ? 'border-blue-500 bg-blue-50 text-blue-600 animate-pulse'
+                      : 'border-gray-200 bg-white text-gray-300'
+                }`}
+              >
+                {isDone ? '✓' : isActive ? '●' : ''}
+              </div>
+              <span className="text-[10px] text-gray-400 w-10 text-center leading-tight">
+                {s.label}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Main upload form ──────────────────────────────────────────────────────────
 
 interface Props {
   onUploaded: (response: UploadResponse) => void;
@@ -14,6 +116,32 @@ export function UploadForm({ onUploaded }: Props) {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Set when the backend returns extraction_status: "processing" for a long doc.
+  const [extractingSession, setExtractingSession] = useState<{
+    sessionId: string;
+    filename: string;
+    docType: string;
+  } | null>(null);
+
+  const handleExtractionComplete = useCallback(
+    (requirements: Requirement[]) => {
+      if (!extractingSession) return;
+      onUploaded({
+        session_id: extractingSession.sessionId,
+        filename: extractingSession.filename,
+        doc_type: extractingSession.docType,
+        extraction_status: 'complete',
+        requirements,
+      });
+    },
+    [extractingSession, onUploaded],
+  );
+
+  const handleExtractionError = useCallback((msg: string) => {
+    setExtractingSession(null);
+    setError(msg);
+  }, []);
 
   const handleFile = useCallback(
     async (file: File) => {
@@ -30,7 +158,16 @@ export function UploadForm({ onUploaded }: Props) {
           onUploaded(mockUploadResponse);
         } else {
           const response = await uploadDocument(file);
-          onUploaded(response);
+          if (response.extraction_status === 'processing') {
+            // Long doc — switch to extraction progress view.
+            setExtractingSession({
+              sessionId: response.session_id,
+              filename: response.filename,
+              docType: response.doc_type,
+            });
+          } else {
+            onUploaded(response);
+          }
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Upload failed. Please try again.');
@@ -59,6 +196,34 @@ export function UploadForm({ onUploaded }: Props) {
     [handleFile],
   );
 
+  // ── Extraction progress view (long docs) ───────────────────────────────
+  if (extractingSession) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
+        <div className="w-full max-w-xl">
+          <div className="mb-8 text-center">
+            <h1 className="text-3xl font-bold text-gray-900">Readily</h1>
+            <p className="mt-2 text-gray-500">Processing compliance document…</p>
+          </div>
+          <div className="bg-white rounded-xl border-2 border-blue-200 shadow-sm p-8">
+            <ExtractionProgress
+              filename={extractingSession.filename}
+              sessionId={extractingSession.sessionId}
+              onComplete={handleExtractionComplete}
+              onError={handleExtractionError}
+            />
+          </div>
+          {error && (
+            <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+              {error}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Default upload drop-zone view ──────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
       <div className="w-full max-w-xl">

@@ -82,11 +82,13 @@ _SESSION_ID = "aaaabbbb-0000-0000-0000-000000000000"
 @pytest.fixture(autouse=True)
 def _clear_sessions():
     """Ensure the in-memory session store is empty before and after each test."""
-    from backend.main import sessions  # noqa: PLC0415
+    from backend.main import sessions, _session_pdf_paths  # noqa: PLC0415
 
     sessions.clear()
+    _session_pdf_paths.clear()
     yield
     sessions.clear()
+    _session_pdf_paths.clear()
 
 
 @pytest.fixture()
@@ -117,8 +119,12 @@ def seeded(client):
 
 class TestUpload:
     def test_valid_pdf_returns_200(self, client):
-        reqs = [_req(1), _req(2)]
-        with patch("backend.main.classify_and_extract", return_value=("structured", reqs)):
+        # Route 1 requires ≥ 3 structured questions
+        reqs = [_req(1), _req(2), _req(3)]
+        with (
+            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]),
+            patch("backend.main.parse_review_form", return_value=reqs),
+        ):
             resp = client.post(
                 "/upload",
                 files={"file": ("report.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
@@ -127,7 +133,8 @@ class TestUpload:
         body = resp.json()
         assert body["filename"] == "report.pdf"
         assert body["doc_type"] == "structured"
-        assert len(body["requirements"]) == 2
+        assert body["extraction_status"] == "complete"
+        assert len(body["requirements"]) == 3
         assert "session_id" in body
 
     def test_non_pdf_returns_400(self, client):
@@ -140,7 +147,7 @@ class TestUpload:
 
     def test_extraction_failure_returns_422(self, client):
         with patch(
-            "backend.main.classify_and_extract",
+            "backend.main.parse_pdf",
             side_effect=RuntimeError("parse error"),
         ):
             resp = client.post(
@@ -153,7 +160,12 @@ class TestUpload:
         from backend.main import sessions  # noqa: PLC0415
 
         reqs = [_req(1)]
-        with patch("backend.main.classify_and_extract", return_value=("narrative", reqs)):
+        # Simulate short narrative (1 page, 0 structured questions)
+        with (
+            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "narrative"}]),
+            patch("backend.main.parse_review_form", return_value=[]),
+            patch("backend.main.run_narrative_extractor", return_value=reqs),
+        ):
             resp = client.post(
                 "/upload",
                 files={"file": ("guide.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
@@ -166,13 +178,34 @@ class TestUpload:
     def test_upload_response_session_id_is_uuid(self, client):
         import uuid  # noqa: PLC0415
 
-        with patch("backend.main.classify_and_extract", return_value=("structured", [])):
+        with (
+            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]),
+            patch("backend.main.parse_review_form", return_value=[]),
+            patch("backend.main.run_narrative_extractor", return_value=[]),
+        ):
             resp = client.post(
                 "/upload",
                 files={"file": ("x.pdf", io.BytesIO(b"%PDF"), "application/pdf")},
             )
         sid = resp.json()["session_id"]
         uuid.UUID(sid)  # raises if not a valid UUID
+
+    def test_long_doc_returns_processing_status(self, client):
+        """A PDF with >20 pages and no structured questions returns extraction_status='processing'."""
+        many_pages = [{"page_number": i, "text": f"page {i}"} for i in range(1, 22)]  # 21 pages
+        with (
+            patch("backend.main.parse_pdf", return_value=many_pages),
+            patch("backend.main.parse_review_form", return_value=[]),
+        ):
+            resp = client.post(
+                "/upload",
+                files={"file": ("long.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["doc_type"] == "compliance"
+        assert body["extraction_status"] == "processing"
+        assert body["requirements"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -529,3 +562,105 @@ class TestStreamReview:
         done = [e for e in events if e.get("event") == "done"]
         assert len(done) == 1
         assert done[0]["data"]["total_evaluations"] == 0
+
+
+# ---------------------------------------------------------------------------
+# GET /upload/{session_id}/extraction-stream (SSE)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractionStream:
+    """Tests for the long-doc extraction SSE endpoint."""
+
+    def _seed_extracting_session(self):
+        """Insert a session in 'extracting' status and return it."""
+        from backend.main import sessions, _session_pdf_paths  # noqa: PLC0415
+
+        sess = _session(status="extracting", requirements=[])
+        sessions[_SESSION_ID] = sess
+        _session_pdf_paths[_SESSION_ID] = "/fake/path.pdf"
+        return sess
+
+    def test_unknown_session_returns_404(self, client):
+        resp = client.get("/upload/no-such-session/extraction-stream")
+        assert resp.status_code == 404
+
+    def test_no_pdf_path_returns_404(self, client):
+        """Session exists but _session_pdf_paths has no entry → 404."""
+        from backend.main import sessions  # noqa: PLC0415
+
+        sess = _session(status="extracting", requirements=[])
+        sessions[_SESSION_ID] = sess
+        # Deliberately do NOT add to _session_pdf_paths
+        resp = client.get(f"/upload/{_SESSION_ID}/extraction-stream")
+        assert resp.status_code == 404
+
+    def test_stream_content_type_is_event_stream(self, client):
+        sess = self._seed_extracting_session()
+
+        async def mock_extractor(pdf_path):
+            yield {"type": "complete", "requirements": [], "total_requirements": 0}
+
+        with patch("backend.main.run_compliance_extractor_with_progress", mock_extractor):
+            resp = client.get(f"/upload/{_SESSION_ID}/extraction-stream")
+
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+
+    def test_stream_emits_extraction_progress_events(self, client):
+        self._seed_extracting_session()
+
+        async def mock_extractor(pdf_path):
+            yield {
+                "type": "progress", "step": "parsing",
+                "step_number": 1, "total_steps": 7, "detail": "Parsing...",
+            }
+            yield {"type": "complete", "requirements": [], "total_requirements": 0}
+
+        with patch("backend.main.run_compliance_extractor_with_progress", mock_extractor):
+            resp = client.get(f"/upload/{_SESSION_ID}/extraction-stream")
+
+        events = _parse_sse_lines(resp.text)
+        progress_events = [e for e in events if e.get("event") == "extraction_progress"]
+        assert len(progress_events) == 1
+        assert progress_events[0]["data"]["step"] == "parsing"
+
+    def test_stream_emits_extraction_complete_event(self, client):
+        self._seed_extracting_session()
+        reqs_data = [{"id": 1, "text": "Does the P&P state X?"}]
+
+        async def mock_extractor(pdf_path):
+            yield {"type": "complete", "requirements": reqs_data, "total_requirements": 1}
+
+        with patch("backend.main.run_compliance_extractor_with_progress", mock_extractor):
+            resp = client.get(f"/upload/{_SESSION_ID}/extraction-stream")
+
+        events = _parse_sse_lines(resp.text)
+        complete_events = [e for e in events if e.get("event") == "extraction_complete"]
+        assert len(complete_events) == 1
+        assert complete_events[0]["data"]["total_requirements"] == 1
+
+    def test_stream_updates_session_requirements(self, client):
+        sess = self._seed_extracting_session()
+        reqs_data = [{"id": 1, "text": "Does the P&P state X?"}, {"id": 2, "text": "Does the P&P state Y?"}]
+
+        async def mock_extractor(pdf_path):
+            yield {"type": "complete", "requirements": reqs_data, "total_requirements": 2}
+
+        with patch("backend.main.run_compliance_extractor_with_progress", mock_extractor):
+            client.get(f"/upload/{_SESSION_ID}/extraction-stream")
+
+        assert len(sess.requirements) == 2
+        assert sess.requirements[0].id == 1
+        assert sess.requirements[1].id == 2
+
+    def test_stream_sets_session_status_reviewing(self, client):
+        sess = self._seed_extracting_session()
+
+        async def mock_extractor(pdf_path):
+            yield {"type": "complete", "requirements": [], "total_requirements": 0}
+
+        with patch("backend.main.run_compliance_extractor_with_progress", mock_extractor):
+            client.get(f"/upload/{_SESSION_ID}/extraction-stream")
+
+        assert sess.status == "reviewing"

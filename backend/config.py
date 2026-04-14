@@ -23,23 +23,24 @@ LONG_DOC_PAGE_THRESHOLD = int(os.getenv("LONG_DOC_PAGE_THRESHOLD", "20"))
 
 # Parallelization
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "8"))
-WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "60"))
+WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "300"))
+INGEST_MAX_WORKERS = int(os.getenv("INGEST_MAX_WORKERS", "4"))
 
 # Embedding
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-# Chunking
-CHUNK_SIZE = 500  # tokens approx (~2000 chars)
-CHUNK_OVERLAP = 100  # chars
+# Chunking — smaller chunks improve retrieval precision and reduce LLM context size.
+# Re-run ingestion after changing these values.
+CHUNK_SIZE = 300  # chars per chunk (~75 tokens)
+CHUNK_OVERLAP = 75  # chars of overlap between adjacent chunks
 
 # RAG
-TOP_K = 10
+TOP_K = 6  # fewer results → smaller LLM context per step → faster + cheaper
 CONFIDENCE_THRESHOLD = 0.7
 
 # ChromaDB
 COLLECTION_NAME = "policy_documents"
 
 # Compliance extraction (Component 8)
-LONG_DOC_PAGE_THRESHOLD = int(os.getenv("LONG_DOC_PAGE_THRESHOLD", "20"))
 SECTION_MAX_CHARS = 5000          # Max chars per section before sub-splitting
 DEDUP_SIMILARITY_THRESHOLD = 0.90

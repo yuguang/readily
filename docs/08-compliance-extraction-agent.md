@@ -354,45 +354,89 @@ def finalize_requirements(
 
 ## Full Pipeline Entry Point
 
+Two entry points: a simple one that returns the final list, and a streaming one that yields progress events for the frontend.
+
 ```python
 async def run_compliance_extractor(pdf_path: str) -> list[Requirement]:
-    """
-    Full extraction pipeline for long regulatory documents.
+    """Simple entry point — returns final requirements list."""
+    results = []
+    async for event in run_compliance_extractor_with_progress(pdf_path):
+        if event["type"] == "complete":
+            results = event["requirements"]
+    return results
 
-    Steps:
-    1. Parse PDF with structure preservation
-    2. Segment into sections
-    3. Filter to obligation-bearing sections
-    4. Extract requirements per section (parallelized)
-    5. Deduplicate
-    6. Assemble hierarchy
-    7. Assign IDs and return
+
+async def run_compliance_extractor_with_progress(
+    pdf_path: str,
+) -> AsyncGenerator[dict, None]:
+    """
+    Streaming entry point — yields progress dicts for each pipeline step.
+
+    Each yielded dict has {"type": "progress", "step": ..., "step_number": ..., ...}
+    or {"type": "complete", "requirements": [...], "total_requirements": N}.
+
+    The API server forwards these as SSE events to the frontend.
     """
     # Step 1: Structured parse
+    yield {"type": "progress", "step": "parsing", "step_number": 1, "total_steps": 7,
+           "detail": "Parsing PDF structure..."}
     structured_text = parse_pdf_with_structure(pdf_path)
 
     # Step 2: Segment
+    yield {"type": "progress", "step": "segmenting", "step_number": 2, "total_steps": 7,
+           "detail": "Segmenting document..."}
     sections = segment_document(structured_text)
+    yield {"type": "progress", "step": "segmenting", "step_number": 2, "total_steps": 7,
+           "detail": f"Found {len(sections)} sections"}
 
     # Step 3: Filter
+    yield {"type": "progress", "step": "filtering", "step_number": 3, "total_steps": 7,
+           "detail": "Filtering for obligation language..."}
     obligation_sections, skipped = filter_obligation_sections(sections)
-    logger.info(
-        "Kept %d/%d sections with obligation language (skipped %d).",
-        len(obligation_sections), len(sections), len(skipped),
-    )
+    yield {"type": "progress", "step": "filtering", "step_number": 3, "total_steps": 7,
+           "detail": f"{len(obligation_sections)} of {len(sections)} sections contain obligation language"}
 
-    # Step 4: Parallel per-section extraction
-    raw_requirements = await extract_from_all_sections(obligation_sections)
+    # Step 4: Parallel per-section extraction (with sub-progress)
+    yield {"type": "progress", "step": "extracting", "step_number": 4, "total_steps": 7,
+           "sections_completed": 0, "sections_total": len(obligation_sections),
+           "detail": "Extracting requirements from sections..."}
+
+    raw_requirements = []
+    completed = 0
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+
+    async def extract_one(section):
+        async with semaphore:
+            return await asyncio.to_thread(run_section_extractor, section)
+
+    tasks = [asyncio.create_task(extract_one(s)) for s in obligation_sections]
+    for coro in asyncio.as_completed(tasks):
+        section_reqs = await coro
+        raw_requirements.extend(section_reqs)
+        completed += 1
+        yield {"type": "progress", "step": "extracting", "step_number": 4, "total_steps": 7,
+               "sections_completed": completed, "sections_total": len(obligation_sections),
+               "detail": "Extracting requirements from sections..."}
 
     # Step 5: Deduplicate
+    yield {"type": "progress", "step": "deduplicating", "step_number": 5, "total_steps": 7,
+           "detail": f"Deduplicating {len(raw_requirements)} requirements..."}
     deduped = deduplicate_requirements(raw_requirements)
-    logger.info("Deduplicated %d → %d requirements.", len(raw_requirements), len(deduped))
+    yield {"type": "progress", "step": "deduplicating", "step_number": 5, "total_steps": 7,
+           "detail": f"Deduplicated {len(raw_requirements)} → {len(deduped)} requirements"}
 
     # Step 6: Hierarchy
+    yield {"type": "progress", "step": "hierarchy", "step_number": 6, "total_steps": 7,
+           "detail": "Assembling requirement hierarchy"}
     with_hierarchy = assemble_hierarchy(deduped, sections)
 
     # Step 7: Finalize
-    return finalize_requirements(with_hierarchy)
+    yield {"type": "progress", "step": "finalizing", "step_number": 7, "total_steps": 7,
+           "detail": "Assigning IDs"}
+    final = finalize_requirements(with_hierarchy)
+
+    yield {"type": "complete", "requirements": [r.model_dump() for r in final],
+           "total_requirements": len(final)}
 ```
 
 ## Table Handling

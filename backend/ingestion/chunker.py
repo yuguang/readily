@@ -75,7 +75,7 @@ def chunk_document(
                 }
             )
             chunk_idx += 1
-        return full[-overlap:] if overlap and len(full) >= overlap else full
+        return full[-overlap:] if overlap else ""
 
     # ── Step 2: greedy paragraph merging ─────────────────────────────────────
     i = 0

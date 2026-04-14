@@ -238,5 +238,6 @@ export const mockUploadResponse: UploadResponse = {
   session_id: 'mock-session-001',
   filename: 'Example_Input_Doc_Easy.pdf',
   doc_type: 'structured',
+  extraction_status: 'complete',
   requirements: mockRequirements,
 };

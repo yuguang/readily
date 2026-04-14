@@ -1,24 +1,128 @@
 # Readily — Agentic Compliance Review
 
-Automates healthcare P&P policy audits against regulatory checklists. An AI agent reviews each compliance question against 373+ policy PDFs using RAG, then streams results to a React UI for human approval.
+Automates healthcare P&P policy audits against regulatory checklists. AI agents review each compliance question against 373+ policy PDFs using RAG, then stream results to a React UI for human approval.
 
-## Architecture
+## Agentic Workflows
 
+### End-to-End Pipeline
+
+```mermaid
+flowchart LR
+    Upload["📄 Upload PDF"] --> Router
+    Router --> Structured["Regex Extraction"]
+    Router --> Short["Narrative Agent"]
+    Router --> Long["Compliance Extraction\nPipeline"]
+    Structured --> Confirm["✅ Confirm\nRequirements"]
+    Short --> Confirm
+    Long -->|SSE progress| Confirm
+    Confirm --> Dispatcher["Parallel Dispatcher\n(8 workers)"]
+    Dispatcher --> QA1["Question Agent"]
+    Dispatcher --> QA2["Question Agent"]
+    Dispatcher --> QAN["Question Agent"]
+    QA1 -->|SSE| Review["📋 Review Table"]
+    QA2 -->|SSE| Review
+    QAN -->|SSE| Review
+    Review --> Critic["Batch Critic\n(low-conf only)"]
+    Critic --> HITL["👤 Human Review\nApprove / Edit / Reject"]
 ```
-React UI (Upload → Confirm Requirements → Review Table)
-       │  SSE stream
-┌──────┴──────┐
-│  FastAPI    │
-└──────┬──────┘
-       │
-  Phase 1           Phase 2              Phase 3
-  Ingestion ──►  Requirement  ──►  Parallel Dispatcher
-  (373 PDFs)     Extraction        (asyncio, 8 workers)
-       │                                  │
-  ChromaDB  ◄── search_policies ──  Question Agents
-                                          │
-                                    Batch Critic
-                                   (low-conf only)
+
+### 1. Requirement Extraction Router
+
+Three-way routing based on document type and length. Runs once per uploaded PDF.
+
+```mermaid
+flowchart TD
+    PDF["Uploaded PDF"] --> Parse["Parse PDF\n(PyMuPDF)"]
+    Parse --> Regex{"Regex finds ≥3\nnumbered questions?"}
+    Regex -->|Yes| Structured["✅ Structured Extraction\n(deterministic regex)\nNo LLM needed"]
+    Regex -->|No| Length{"Page count\n> 20?"}
+    Length -->|"≤ 20 pages"| Narrative["📝 Narrative Agent\nSingle-pass ToolCallingAgent\nReads full text → extracts requirements"]
+    Length -->|"> 20 pages"| Compliance["📚 Compliance Extraction Pipeline\n(Component 8)"]
+    Structured --> Reqs["list of Requirement"]
+    Narrative --> Reqs
+    Compliance -->|"Enriched schema\n+ progress streaming"| Reqs
+```
+
+### 2. Compliance Extraction Agent (Long Documents)
+
+For long regulatory PDFs (e.g. 145-page DHCS policy guides). Segments the document, filters for obligation language, extracts per-section in parallel, then deduplicates and assembles a hierarchy.
+
+```mermaid
+flowchart TD
+    PDF["PDF (145 pages)"] --> S1["1. Structured Parsing\nPyMuPDF: headings + tables + page numbers"]
+    S1 --> S2["2. Section Segmentation\nSplit on headings → 52 sections"]
+    S2 --> S3["3. Obligation Filtering\nRule-based keyword match\n(must / shall / required / prohibited)"]
+    S3 -->|"~28 sections pass\n~24 skipped"| S4
+    S4["4. Per-Section LLM Extraction\nToolCallingAgent × 28 sections\n(parallelized, 8 workers)"]
+    S4 --> S5["5. Deduplication\nEmbedding similarity > 0.90\n87 → 62 requirements"]
+    S5 --> S6["6. Hierarchy Assembly\nLink sub-requirements to parents\n(H1 → H2 → H3 nesting)"]
+    S6 --> S7["7. Finalize\nAssign sequential IDs"]
+    S7 --> Out["list of ComplianceRequirement\n(enriched schema)"]
+
+    style S3 fill:#fef3c7,stroke:#f59e0b
+    style S4 fill:#dbeafe,stroke:#3b82f6
+    style S5 fill:#fce7f3,stroke:#ec4899
+```
+
+### 3. Question Agent (RAG per Requirement)
+
+One self-contained `ToolCallingAgent` per compliance question. Each parallel worker instantiates its own agent — no shared state.
+
+```mermaid
+flowchart TD
+    Req["Requirement #N\n'Does the P&P state that...'"] --> Expand["Expand into 2-3\nsearch queries"]
+    Expand --> Search1["🔍 search_policies\n(query 1)"]
+    Expand --> Search2["🔍 search_policies\n(query 2)"]
+    Search1 --> Pick["Select best passage\nfrom top-10 results"]
+    Search2 --> Pick
+    Pick --> Eval{"Passage satisfies\nrequirement?"}
+    Eval -->|Clear answer| Answer["Return Evaluation\n{answer, citation, confidence, reasoning}"]
+    Eval -->|Borderline| Cite["🔍 evaluate_citation\n(second opinion tool)"]
+    Cite --> Answer
+    Eval -->|No good match| Retry{"Retries\nleft?"}
+    Retry -->|Yes| Expand
+    Retry -->|No| NoAnswer["Return 'no'\nlow confidence"]
+
+    style Search1 fill:#dbeafe,stroke:#3b82f6
+    style Search2 fill:#dbeafe,stroke:#3b82f6
+    style Cite fill:#dbeafe,stroke:#3b82f6
+```
+
+### 4. Parallel Dispatcher + Batch Critic
+
+Fans out N requirements to concurrent workers, streams results via SSE, then runs a reflection pass on low-confidence results.
+
+```mermaid
+flowchart TD
+    Reqs["64 Requirements"] --> Dispatch["Parallel Dispatcher\nasyncio.Semaphore(8)"]
+    Dispatch --> W1["Worker 1\nQuestion Agent"]
+    Dispatch --> W2["Worker 2\nQuestion Agent"]
+    Dispatch --> W3["..."]
+    Dispatch --> W8["Worker 8\nQuestion Agent"]
+    W1 -->|"SSE: evaluation"| Collect["Collect Results\n(stream to UI as each completes)"]
+    W2 -->|"SSE: evaluation"| Collect
+    W3 -->|"SSE: evaluation"| Collect
+    W8 -->|"SSE: evaluation"| Collect
+    Collect --> Filter{"confidence\n< 0.7?"}
+    Filter -->|"~10-15% low-conf"| Critic["Batch Critic\nSingle LLM call reviews all\nlow-confidence results"]
+    Filter -->|"High confidence"| Done["✅ Final Evaluations"]
+    Critic -->|"Update flags:\nneeds_human_review"| Done
+
+    style Dispatch fill:#dbeafe,stroke:#3b82f6
+    style Critic fill:#fef3c7,stroke:#f59e0b
+```
+
+### 5. Ingestion Pipeline (One-Time Setup)
+
+Parses 373 policy PDFs, chunks them, generates embeddings, and stores in ChromaDB.
+
+```mermaid
+flowchart LR
+    PDFs["373 Policy PDFs\n(10 folders)"] --> Parse["PyMuPDF\nExtract text + page numbers"]
+    Parse --> Chunk["Semantic Chunking\n~2000 chars, 100 char overlap"]
+    Chunk --> Embed["Sentence Transformers\nall-MiniLM-L6-v2"]
+    Embed --> Store["ChromaDB\npolicy_documents collection"]
+    Store --> Ready["Ready for\nsearch_policies queries"]
 ```
 
 ## Prerequisites
@@ -100,16 +204,17 @@ This parses all PDFs, chunks them, generates embeddings, and stores them in `chr
 ### Step 2: Start the backend
 
 ```sh
-uvicorn backend.main:app --reload --port 8080
+uvicorn backend.main:app --reload --port 8000
 ```
 
-The API will be available at `http://localhost:8080`. Key endpoints:
+The API will be available at `http://localhost:8000`. Key endpoints:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/upload` | Upload a review form PDF |
+| GET | `/upload/{id}/extraction-stream` | SSE progress for long doc extraction |
 | POST | `/review/{id}/start` | Start parallel review |
-| GET | `/review/{id}/stream` | SSE stream of results |
+| GET | `/review/{id}/stream` | SSE stream of evaluation results |
 | GET | `/review/{id}/results` | All evaluations |
 | PATCH | `/review/{id}/results/{n}` | Edit one evaluation |
 | POST | `/review/{id}/bulk-approve` | Bulk approve |
@@ -140,30 +245,32 @@ cd frontend && npm run typecheck
 readily/
 ├── backend/
 │   ├── agents/
-│   │   ├── dispatcher.py       # Parallel fan-out (asyncio semaphore)
-│   │   ├── question_agent.py   # Per-question ToolCallingAgent
-│   │   ├── critic.py           # Batch reflection on low-confidence results
-│   │   └── extractor.py        # Requirement extraction (routing)
+│   │   ├── dispatcher.py            # Parallel fan-out (asyncio semaphore)
+│   │   ├── question_agent.py        # Per-question ToolCallingAgent
+│   │   ├── critic.py                # Batch reflection on low-confidence results
+│   │   ├── extractor.py             # Requirement extraction (3-way routing)
+│   │   └── compliance_extractor.py  # Long-doc extraction pipeline
 │   ├── tools/
-│   │   ├── pdf_parser.py       # PyMuPDF text extraction
-│   │   ├── review_form_parser.py
-│   │   ├── policy_search.py    # ChromaDB vector search
-│   │   └── narrative_extractor.py
+│   │   ├── pdf_parser.py            # PyMuPDF text extraction
+│   │   ├── review_form_parser.py    # Structured form regex parser
+│   │   ├── policy_search.py         # ChromaDB vector search
+│   │   ├── narrative_extractor.py   # Single-pass LLM extraction
+│   │   └── document_segmenter.py    # Section segmentation for long docs
 │   ├── ingestion/
-│   │   ├── ingest.py           # Bulk PDF → ChromaDB pipeline
-│   │   └── chunker.py          # Semantic-aware text chunking
+│   │   ├── ingest.py                # Bulk PDF → ChromaDB pipeline
+│   │   └── chunker.py               # Semantic-aware text chunking
 │   ├── models/
-│   │   └── schemas.py          # Pydantic models (shared contracts)
+│   │   └── schemas.py               # Pydantic models (shared contracts)
 │   ├── config.py
 │   └── requirements.txt
 ├── frontend/
 │   └── src/
 │       ├── api/client.ts
-│       ├── components/         # UploadForm, ReviewTable, EvidenceCard, etc.
-│       ├── hooks/useReview.ts  # SSE subscription + state
+│       ├── components/              # UploadForm, ReviewTable, EvidenceCard, etc.
+│       ├── hooks/                   # useReview (SSE), useExtractionProgress
 │       └── types.ts
-├── data/                       # Policy PDFs + example input docs
-├── docs/                       # Design documents (00–07)
+├── data/                            # Policy PDFs + example input docs
+├── docs/                            # Design documents (00–08)
 └── README.md
 ```
 
@@ -186,3 +293,4 @@ Detailed component designs are in `docs/`:
 - [05 — Parallel Dispatcher + Critic](docs/05-parallel-dispatcher.md)
 - [06 — API Server](docs/06-api-server.md)
 - [07 — React Frontend](docs/07-react-frontend.md)
+- [08 — Compliance Extraction Agent](docs/08-compliance-extraction-agent.md)

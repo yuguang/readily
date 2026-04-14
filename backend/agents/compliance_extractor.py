@@ -21,6 +21,8 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import AsyncGenerator
+from typing import Any
 from typing import Any
 
 import numpy as np
@@ -556,74 +558,149 @@ def extract_table_requirements(
 
 
 # ---------------------------------------------------------------------------
-# Full pipeline entry point
+# Full pipeline entry point — streaming and simple variants
 # ---------------------------------------------------------------------------
+
+
+async def run_compliance_extractor_with_progress(
+    pdf_path: str,
+) -> AsyncGenerator[dict, None]:
+    """
+    Streaming extraction pipeline — yields progress dicts for each step.
+
+    Each yielded dict is one of:
+
+    - ``{"type": "progress", "step": str, "step_number": int,
+         "total_steps": 7, "detail": str, ...}``
+    - ``{"type": "complete", "requirements": list[dict],
+         "total_requirements": int}``
+
+    Step 4 (extraction) additionally includes
+    ``sections_completed`` and ``sections_total`` for sub-progress tracking.
+
+    The API server forwards these as SSE events to the frontend.
+
+    Args:
+        pdf_path: Path to the uploaded PDF file.
+
+    Yields:
+        Progress and completion events as plain ``dict`` objects.
+    """
+    _steps = 7
+
+    def _prog(step: str, step_number: int, detail: str, **extra: Any) -> dict:
+        return {"type": "progress", "step": step, "step_number": step_number,
+                "total_steps": _steps, "detail": detail, **extra}
+
+    # Step 1: Structured parse
+    yield _prog("parsing", 1, "Parsing PDF structure...")
+    logger.info("Compliance extractor: parsing %s with structure preservation.", pdf_path)
+    structured_text = parse_pdf_with_structure(pdf_path)
+    if not structured_text.strip():
+        logger.warning("Compliance extractor: no text extracted from %s.", pdf_path)
+        yield {"type": "complete", "requirements": [], "total_requirements": 0}
+        return
+
+    # Step 2: Segment
+    yield _prog("segmenting", 2, "Segmenting document...")
+    sections = segment_document(structured_text)
+    yield _prog("segmenting", 2, f"Found {len(sections)} sections")
+    logger.info("Compliance extractor: %d sections found.", len(sections))
+
+    # Step 3: Filter
+    yield _prog("filtering", 3, "Filtering for obligation language...")
+    obligation_sections, skipped = filter_obligation_sections(sections)
+    yield _prog(
+        "filtering", 3,
+        f"{len(obligation_sections)} of {len(sections)} sections contain obligation language",
+    )
+    logger.info(
+        "Compliance extractor: kept %d/%d sections (skipped %d).",
+        len(obligation_sections), len(sections), len(skipped),
+    )
+
+    if not obligation_sections:
+        logger.warning("Compliance extractor: no obligation sections found in %s.", pdf_path)
+        yield {"type": "complete", "requirements": [], "total_requirements": 0}
+        return
+
+    # Step 4: Parallel per-section extraction with sub-progress
+    yield _prog(
+        "extracting", 4, "Extracting requirements from sections...",
+        sections_completed=0, sections_total=len(obligation_sections),
+    )
+    raw_requirements: list[ComplianceRequirement] = []
+    completed = 0
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+
+    async def _extract_one(section: DocumentSection) -> list[ComplianceRequirement]:
+        async with semaphore:
+            return await asyncio.to_thread(run_section_extractor, section)
+
+    tasks = [asyncio.create_task(_extract_one(s)) for s in obligation_sections]
+    for coro in asyncio.as_completed(tasks):
+        section_reqs = await coro
+        raw_requirements.extend(section_reqs)
+        completed += 1
+        yield _prog(
+            "extracting", 4, "Extracting requirements from sections...",
+            sections_completed=completed, sections_total=len(obligation_sections),
+        )
+
+    logger.info("Compliance extractor: extracted %d raw requirements.", len(raw_requirements))
+
+    if not raw_requirements:
+        logger.warning("Compliance extractor: zero requirements from %s.", pdf_path)
+        yield {"type": "complete", "requirements": [], "total_requirements": 0}
+        return
+
+    # Step 5: Deduplicate
+    yield _prog("deduplicating", 5, f"Deduplicating {len(raw_requirements)} requirements...")
+    deduped = deduplicate_requirements(raw_requirements)
+    yield _prog(
+        "deduplicating", 5,
+        f"Deduplicated {len(raw_requirements)} \u2192 {len(deduped)} requirements",
+    )
+    logger.info(
+        "Compliance extractor: deduplicated %d \u2192 %d requirements.",
+        len(raw_requirements), len(deduped),
+    )
+
+    # Step 6: Hierarchy
+    yield _prog("hierarchy", 6, "Assembling requirement hierarchy")
+    with_hierarchy = assemble_hierarchy(deduped, sections)
+
+    # Step 7: Finalize
+    yield _prog("finalizing", 7, "Assigning IDs")
+    final = finalize_requirements(with_hierarchy)
+
+    yield {
+        "type": "complete",
+        "requirements": [r.model_dump() for r in final],
+        "total_requirements": len(final),
+    }
 
 
 async def run_compliance_extractor(pdf_path: str) -> list[Requirement]:
     """
-    Full extraction pipeline for long regulatory documents.
+    Simple (non-streaming) entry point — collects and returns the final list.
 
-    Steps:
-    1. Parse PDF with structure preservation
-    2. Segment into sections
-    3. Filter to obligation-bearing sections
-    4. Extract requirements per section (parallelized)
-    5. Deduplicate
-    6. Assemble hierarchy
-    7. Assign IDs and return
+    Delegates to :func:`run_compliance_extractor_with_progress` and discards
+    all intermediate progress events, returning only the final requirements.
 
     Args:
         pdf_path: Path to the uploaded PDF file.
 
     Returns:
-        List of :class:`~backend.models.schemas.Requirement` (actually
-        :class:`~backend.models.schemas.ComplianceRequirement`) objects.
+        List of :class:`~backend.models.schemas.ComplianceRequirement` objects.
     """
-    # Step 1: Structured parse
-    logger.info("Compliance extractor: parsing %s with structure preservation.", pdf_path)
-    structured_text = parse_pdf_with_structure(pdf_path)
-    if not structured_text.strip():
-        logger.warning("Compliance extractor: no text extracted from %s.", pdf_path)
-        return []
-
-    # Step 2: Segment
-    sections = segment_document(structured_text)
-    logger.info("Compliance extractor: %d sections found.", len(sections))
-
-    # Step 3: Filter
-    obligation_sections, skipped = filter_obligation_sections(sections)
-    logger.info(
-        "Compliance extractor: kept %d/%d sections with obligation language (skipped %d).",
-        len(obligation_sections),
-        len(sections),
-        len(skipped),
-    )
-
-    if not obligation_sections:
-        logger.warning("Compliance extractor: no obligation sections found in %s.", pdf_path)
-        return []
-
-    # Step 4: Parallel per-section extraction
-    raw_requirements = await extract_from_all_sections(obligation_sections)
-    logger.info("Compliance extractor: extracted %d raw requirements.", len(raw_requirements))
-
-    if not raw_requirements:
-        logger.warning(
-            "Compliance extractor: zero requirements extracted from %s.", pdf_path
-        )
-        return []
-
-    # Step 5: Deduplicate
-    deduped = deduplicate_requirements(raw_requirements)
-    logger.info(
-        "Compliance extractor: deduplicated %d \u2192 %d requirements.",
-        len(raw_requirements),
-        len(deduped),
-    )
-
-    # Step 6: Hierarchy
-    with_hierarchy = assemble_hierarchy(deduped, sections)
-
-    # Step 7: Finalize
-    return finalize_requirements(with_hierarchy)
+    async for event in run_compliance_extractor_with_progress(pdf_path):
+        if event["type"] == "complete":
+            results: list[Requirement] = []
+            for r in event["requirements"]:
+                try:
+                    results.append(ComplianceRequirement.model_validate(r))
+                except Exception:
+                    results.append(Requirement.model_validate(r))
+            return results
+    return []

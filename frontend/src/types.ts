@@ -35,10 +35,22 @@ export interface ReviewSession {
   progress: number;
 }
 
+export interface ExtractionStep {
+  step: string;
+  step_number: number;
+  total_steps: number;
+  detail: string;
+  sections_completed?: number;
+  sections_total?: number;
+}
+
 export interface UploadResponse {
   session_id: string;
   filename: string;
   doc_type: string;
+  /** "complete" for short/structured docs; "processing" for long narrative docs. */
+  extraction_status: 'complete' | 'processing';
+  /** Populated immediately for complete docs; empty list when processing. */
   requirements: Requirement[];
 }
 

@@ -194,7 +194,9 @@ class TestChunkDocument:
             {"page_number": 1, "text": "Page one paragraph."},
             {"page_number": 2, "text": "Page two paragraph."},
         ]
-        chunks = chunk_document(pages, source_file="x/y.pdf", chunk_size=50, overlap=0)
+        # chunk_size=25: each 20-char paragraph fits alone but not both together
+        # (20 + 2 sep + 20 = 42 > 25), so we get two chunks on two different pages.
+        chunks = chunk_document(pages, source_file="x/y.pdf", chunk_size=25, overlap=0)
         page_nums = {c["page_number"] for c in chunks}
         # Both pages should be represented
         assert 1 in page_nums

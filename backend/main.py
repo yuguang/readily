@@ -20,17 +20,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
+from backend.agents.compliance_extractor import run_compliance_extractor_with_progress
 from backend.agents.dispatcher import stream_review
-from backend.agents.extractor import classify_and_extract
-from backend.config import UPLOADS_DIR
+from backend.config import LONG_DOC_PAGE_THRESHOLD, UPLOADS_DIR
 from backend.models.schemas import (
     BulkApproveRequest,
     Evaluation,
+    Requirement,
     ReviewSession,
     UpdateEvaluationRequest,
     UploadResponse,
 )
+from backend.tools.narrative_extractor import run_narrative_extractor
+from backend.tools.pdf_parser import parse_pdf
 from backend.tools.policy_search import get_chroma_collection
+from backend.tools.review_form_parser import parse_review_form
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,12 @@ app.add_middleware(
 
 sessions: dict[str, ReviewSession] = {}
 
+# Maps session_id → uploaded PDF path (kept for the extraction-stream endpoint)
+_session_pdf_paths: dict[str, str] = {}
+
+# Minimum structured questions to classify as structured form (mirrors extractor.py)
+_STRUCTURED_THRESHOLD = 3
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -105,8 +115,19 @@ def _get_evaluation(session: ReviewSession, requirement_id: int) -> Evaluation:
 async def upload_pdf(file: UploadFile) -> UploadResponse:
     """Upload a regulatory PDF and extract compliance requirements.
 
-    Saves the file to ``uploads/{session_id}.pdf``, classifies it, extracts
-    requirements, and creates an in-memory :class:`ReviewSession`.
+    Saves the file to ``uploads/{session_id}.pdf``, then routes on document
+    type and length:
+
+    - **Structured** (regex-detectable numbered questions): requirements
+      extracted synchronously; response includes full list with
+      ``extraction_status="complete"``.
+    - **Short narrative** (≤20 pages): single-pass LLM extraction runs
+      synchronously; response includes full list with
+      ``extraction_status="complete"``.
+    - **Long compliance doc** (>20 pages, no structured questions): returns
+      immediately with ``extraction_status="processing"`` and an empty
+      requirements list.  The frontend connects to
+      ``GET /upload/{session_id}/extraction-stream`` for real-time progress.
     """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
@@ -118,10 +139,31 @@ async def upload_pdf(file: UploadFile) -> UploadResponse:
     pdf_path.write_bytes(contents)
 
     try:
-        doc_type, requirements = await classify_and_extract(str(pdf_path))
+        pages = parse_pdf(str(pdf_path))
+
+        if not pages:
+            # Empty / image-only PDF — nothing to extract
+            doc_type, requirements, extraction_status = "narrative", [], "complete"
+        else:
+            full_text = "\n".join(p["text"] for p in pages)
+
+            # Route 1: structured form (regex, no LLM)
+            reqs = parse_review_form(full_text)
+            if len(reqs) >= _STRUCTURED_THRESHOLD:
+                doc_type, requirements, extraction_status = "structured", reqs, "complete"
+
+            # Route 2: long compliance doc — return immediately
+            elif len(pages) > LONG_DOC_PAGE_THRESHOLD:
+                doc_type, requirements, extraction_status = "compliance", [], "processing"
+
+            # Route 3: short narrative — single-pass LLM (synchronous)
+            else:
+                requirements = run_narrative_extractor(full_text)
+                doc_type, extraction_status = "narrative", "complete"
+
     except Exception as exc:
         pdf_path.unlink(missing_ok=True)
-        logger.error("Failed to extract requirements from %s: %s", file.filename, exc)
+        logger.error("Failed to process %s: %s", file.filename, exc)
         raise HTTPException(
             status_code=422, detail=f"Could not process PDF: {exc}"
         ) from exc
@@ -132,16 +174,72 @@ async def upload_pdf(file: UploadFile) -> UploadResponse:
         doc_type=doc_type,
         requirements=requirements,
         created_at=datetime.now(timezone.utc),
-        status="reviewing",
+        status="extracting" if extraction_status == "processing" else "reviewing",
     )
     sessions[session_id] = session
+    _session_pdf_paths[session_id] = str(pdf_path)
 
     return UploadResponse(
         session_id=session_id,
         filename=file.filename,
         doc_type=doc_type,
+        extraction_status=extraction_status,
         requirements=requirements,
     )
+
+
+@app.get("/upload/{session_id}/extraction-stream")
+async def stream_extraction_progress(session_id: str) -> EventSourceResponse:
+    """SSE endpoint — streams compliance extraction progress for long documents.
+
+    Connect after receiving ``extraction_status="processing"`` from
+    ``POST /upload``.  Events emitted:
+
+    * ``extraction_progress`` — one per pipeline step (and sub-step during
+      section extraction), payload matches the progress dict schema from
+      :func:`~backend.agents.compliance_extractor.run_compliance_extractor_with_progress`.
+    * ``extraction_complete`` — final event; payload includes the full
+      ``requirements`` list and ``total_requirements`` count.
+    """
+    session = _get_session(session_id)
+    pdf_path = _session_pdf_paths.get(session_id)
+    if not pdf_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No PDF path found for session {session_id!r}.",
+        )
+
+    async def event_generator():
+        try:
+            async for progress in run_compliance_extractor_with_progress(pdf_path):
+                if progress["type"] == "progress":
+                    yield {
+                        "event": "extraction_progress",
+                        "data": json.dumps(progress),
+                    }
+                elif progress["type"] == "complete":
+                    # Populate session requirements from the completed extraction
+                    session.requirements = [
+                        Requirement(**r) for r in progress["requirements"]
+                    ]
+                    session.status = "reviewing"
+                    yield {
+                        "event": "extraction_complete",
+                        "data": json.dumps({
+                            "total_requirements": progress["total_requirements"],
+                            "requirements": progress["requirements"],
+                        }),
+                    }
+        except Exception as exc:
+            logger.error(
+                "Extraction stream failed for session %s: %s", session_id, exc
+            )
+            yield {
+                "event": "extraction_error",
+                "data": json.dumps({"error": str(exc)}),
+            }
+
+    return EventSourceResponse(event_generator())
 
 
 @app.post("/review/{session_id}/start")

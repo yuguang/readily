@@ -17,10 +17,80 @@ A React single-page app with three views: Upload → Requirements Confirmation �
 
 ### 1. Upload View (`UploadForm.tsx`)
 - Drag-and-drop or file picker for PDF upload
-- Shows upload progress spinner
-- On success, transitions to Requirements Confirmation
+- **Short docs**: shows spinner, transitions to Requirements Confirmation on completion
+- **Long docs** (`extraction_status: "processing"`): shows a multi-step progress bar with real-time updates via SSE
 
-**API call**: `POST /upload` with `multipart/form-data`
+**API calls**:
+- `POST /upload` with `multipart/form-data` — returns immediately for long docs
+- `GET /upload/{session_id}/extraction-stream` — SSE stream for extraction progress (long docs only)
+
+#### Extraction Progress Bar (Long Documents)
+When the upload response has `extraction_status: "processing"`, the upload zone transforms into a progress display:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                                                      │
+│  Processing: Example Input Doc - Hard.pdf            │
+│  145 pages · compliance document                     │
+│                                                      │
+│  Step 4 of 7: Extracting requirements                │
+│  ████████████████░░░░░░░░░░  12 / 28 sections        │
+│                                                      │
+│  ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐        │
+│  │ ✓ │ │ ✓ │ │ ✓ │ │ ● │ │   │ │   │ │   │        │
+│  └───┘ └───┘ └───┘ └───┘ └───┘ └───┘ └───┘        │
+│  Parse Segment Filter Extract Dedup Hier  Done       │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+```
+
+**Step indicators**: 7 circles in a row, each representing a pipeline step. Completed steps show a checkmark, the active step pulses, and future steps are grayed out.
+
+**Sub-progress**: Step 4 (extraction) is the longest and shows a secondary progress bar with `sections_completed / sections_total` from the SSE events.
+
+**State**: managed by a `useExtractionProgress` hook (below). On `extraction_complete`, transitions to Requirements Confirmation.
+
+#### `useExtractionProgress` Hook
+```typescript
+interface ExtractionStep {
+  step: string;
+  step_number: number;
+  total_steps: number;
+  detail: string;
+  sections_completed?: number;
+  sections_total?: number;
+}
+
+function useExtractionProgress(sessionId: string | null) {
+  const [currentStep, setCurrentStep] = useState<ExtractionStep | null>(null);
+  const [requirements, setRequirements] = useState<Requirement[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const es = new EventSource(`/api/upload/${sessionId}/extraction-stream`);
+
+    es.addEventListener('extraction_progress', (e) => {
+      setCurrentStep(JSON.parse(e.data));
+    });
+
+    es.addEventListener('extraction_complete', (e) => {
+      const data = JSON.parse(e.data);
+      setRequirements(data.requirements);
+      es.close();
+    });
+
+    es.onerror = () => {
+      setError('Connection lost during extraction. Refresh to check status.');
+      es.close();
+    };
+
+    return () => es.close();
+  }, [sessionId]);
+
+  return { currentStep, requirements, error };
+}
+```
 
 ### 2. Requirements Confirmation View (`RequirementsList.tsx`)
 - Displays the list of extracted requirements (from `UploadResponse`)
