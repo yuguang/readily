@@ -100,10 +100,10 @@ This parses all PDFs, chunks them, generates embeddings, and stores them in `chr
 ### Step 2: Start the backend
 
 ```sh
-uvicorn backend.main:app --reload --port 8000
+uvicorn backend.main:app --reload --port 8080
 ```
 
-The API will be available at `http://localhost:8000`. Key endpoints:
+The API will be available at `http://localhost:8080`. Key endpoints:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|

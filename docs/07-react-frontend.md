@@ -153,7 +153,7 @@ function useReview(sessionId: string) {
 
 ## API Client (`api/client.ts`)
 ```typescript
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 
 export async function uploadDocument(file: File): Promise<UploadResponse> { ... }
 export async function startReview(sessionId: string): Promise<void> { ... }
