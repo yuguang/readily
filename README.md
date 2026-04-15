@@ -64,31 +64,7 @@ flowchart TD
     style S5 fill:#fce7f3,stroke:#ec4899
 ```
 
-### 3. Question Agent (RAG per Requirement)
-
-One self-contained `ToolCallingAgent` per compliance question. Each parallel worker instantiates its own agent — no shared state.
-
-```mermaid
-flowchart TD
-    Req["Requirement #N\n'Does the P&P state that...'"] --> Expand["Expand into 2-3\nsearch queries"]
-    Expand --> Search1["🔍 search_policies\n(query 1)"]
-    Expand --> Search2["🔍 search_policies\n(query 2)"]
-    Search1 --> Pick["Select best passage\nfrom top-10 results"]
-    Search2 --> Pick
-    Pick --> Eval{"Passage satisfies\nrequirement?"}
-    Eval -->|Clear answer| Answer["Return Evaluation\n{answer, citation, confidence, reasoning}"]
-    Eval -->|Borderline| Cite["🔍 evaluate_citation\n(second opinion tool)"]
-    Cite --> Answer
-    Eval -->|No good match| Retry{"Retries\nleft?"}
-    Retry -->|Yes| Expand
-    Retry -->|No| NoAnswer["Return 'no'\nlow confidence"]
-
-    style Search1 fill:#dbeafe,stroke:#3b82f6
-    style Search2 fill:#dbeafe,stroke:#3b82f6
-    style Cite fill:#dbeafe,stroke:#3b82f6
-```
-
-### 4. Parallel Dispatcher + Batch Critic
+### 3. Parallel Dispatcher + Batch Critic
 
 Fans out N requirements to concurrent workers, streams results via SSE, then runs a reflection pass on low-confidence results.
 
@@ -110,6 +86,30 @@ flowchart TD
 
     style Dispatch fill:#dbeafe,stroke:#3b82f6
     style Critic fill:#fef3c7,stroke:#f59e0b
+```
+
+### 3.1 Question Agent (RAG per Requirement)
+
+One self-contained `ToolCallingAgent` is created per compliance requirement. Each parallel worker instantiates its own agent with no shared state.
+
+```mermaid
+flowchart TD
+    Req["Requirement #N\n'Does the P&P state that...'"] --> Expand["Expand into 2-3\nsearch queries"]
+    Expand --> Search1["🔍 search_policies\n(query 1)"]
+    Expand --> Search2["🔍 search_policies\n(query 2)"]
+    Search1 --> Pick["Select best passage\nfrom top-10 results"]
+    Search2 --> Pick
+    Pick --> Eval{"Passage satisfies\nrequirement?"}
+    Eval -->|Clear answer| Answer["Return Evaluation\n{answer, citation, confidence, reasoning}"]
+    Eval -->|Borderline| Cite["🔍 evaluate_citation\n(second opinion tool)"]
+    Cite --> Answer
+    Eval -->|No good match| Retry{"Retries\nleft?"}
+    Retry -->|Yes| Expand
+    Retry -->|No| NoAnswer["Return 'no'\nlow confidence"]
+
+    style Search1 fill:#dbeafe,stroke:#3b82f6
+    style Search2 fill:#dbeafe,stroke:#3b82f6
+    style Cite fill:#dbeafe,stroke:#3b82f6
 ```
 
 ### 5. Ingestion Pipeline (One-Time Setup)
