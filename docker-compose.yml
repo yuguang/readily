@@ -1,0 +1,33 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./uploads:/app/uploads
+      - ./data:/app/data:ro
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - LLM_MODEL_ID=${LLM_MODEL_ID:-gemini-2.5-pro}
+      - LITELLM_MODEL_ID=${LITELLM_MODEL_ID:-gemini/gemini-2.5-pro}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - COMPLIANCE_LLM_MODEL_ID=${COMPLIANCE_LLM_MODEL_ID:-gpt-5.4-mini}
+      - COMPLIANCE_LLM_API_BASE=${COMPLIANCE_LLM_API_BASE:-}
+      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-8}
+      - COMPLIANCE_MAX_CONCURRENT_WORKERS=${COMPLIANCE_MAX_CONCURRENT_WORKERS:-20}
+      - LONG_DOC_PAGE_THRESHOLD=${LONG_DOC_PAGE_THRESHOLD:-20}
+      - WORKER_TIMEOUT_SECONDS=${WORKER_TIMEOUT_SECONDS:-300}
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

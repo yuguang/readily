@@ -1,0 +1,27 @@
+.git
+.venv
+.env
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.pytest_cache
+.mypy_cache
+conftest.py
+test.py
+
+# Node
+frontend/node_modules
+frontend/dist
+
+# Runtime data (volume-mounted)
+chroma_db
+uploads
+logs
+
+# Docs / misc
+docs
+README.md
