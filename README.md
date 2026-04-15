@@ -33,7 +33,7 @@ Three-way routing based on document type and length. Runs once per uploaded PDF.
 ```mermaid
 flowchart TD
     PDF["Uploaded PDF"] --> Parse["Parse PDF\n(PyMuPDF)"]
-    Parse --> Regex{"Regex finds ≥3\nnumbered questions?"}
+    Parse --> Regex{"Regex finds ≥5\nnumbered questions?"}
     Regex -->|Yes| Structured["✅ Structured Extraction\n(deterministic regex)\nNo LLM needed"]
     Regex -->|No| Length{"Page count\n> 20?"}
     Length -->|"≤ 20 pages"| Narrative["📝 Narrative Agent\nSingle-pass ToolCallingAgent\nReads full text → extracts requirements"]
