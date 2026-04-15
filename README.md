@@ -37,7 +37,7 @@ flowchart TD
     Regex -->|Yes| Structured["✅ Structured Extraction\n(deterministic regex)\nNo LLM needed"]
     Regex -->|No| Length{"Page count\n> 20?"}
     Length -->|"≤ 20 pages"| Narrative["📝 Narrative Agent\nSingle-pass ToolCallingAgent\nReads full text → extracts requirements"]
-    Length -->|"> 20 pages"| Compliance["📚 Compliance Extraction Pipeline\n(Component 8)"]
+    Length -->|"> 20 pages"| Compliance["📚 Compliance Extraction Pipeline\n"]
     Structured --> Reqs["list of Requirement"]
     Narrative --> Reqs
     Compliance -->|"Enriched schema\n+ progress streaming"| Reqs
