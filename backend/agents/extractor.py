@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # structured review form.  Below this threshold we fall back to narrative
 # extraction (avoids false positives from documents with a few incidental
 # "Does the P&P" mentions).
-_STRUCTURED_THRESHOLD = 5
+_STRUCTURED_THRESHOLD = 3
 
 
 # ---------------------------------------------------------------------------
