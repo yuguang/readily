@@ -80,6 +80,24 @@ _SESSION_ID = "aaaabbbb-0000-0000-0000-000000000000"
 
 
 @pytest.fixture(autouse=True)
+def _reset_sse_app_status():
+    """Reset sse_starlette AppStatus before/after each test.
+
+    AppStatus.should_exit_event is a class-level asyncio.Event that is lazily
+    created on first use and bound to that test's event loop.  Without this
+    reset, subsequent tests that create a new event loop (as TestClient does)
+    get a RuntimeError because the old Event is bound to a different loop.
+    """
+    from sse_starlette.sse import AppStatus  # noqa: PLC0415
+
+    AppStatus.should_exit_event = None
+    AppStatus.should_exit = False
+    yield
+    AppStatus.should_exit_event = None
+    AppStatus.should_exit = False
+
+
+@pytest.fixture(autouse=True)
 def _clear_sessions():
     """Ensure the in-memory session store is empty before and after each test."""
     from backend.main import sessions, _session_pdf_paths  # noqa: PLC0415
