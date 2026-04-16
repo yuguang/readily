@@ -9,6 +9,9 @@ const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
+    if (res.status === 413) {
+      throw new Error('File is too large. Please upload a smaller PDF (max 50 MB).');
+    }
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`API error ${res.status}: ${text}`);
   }
