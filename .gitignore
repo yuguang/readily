@@ -6,6 +6,9 @@ logs/
 # zip files
 *.zip
 
+# ChromaDB
+chroma.sqlite3
+
 # Python
 __pycache__/
 *.py[cod]
