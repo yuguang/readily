@@ -58,8 +58,3 @@ DEDUP_SIMILARITY_THRESHOLD = 0.90
 TERM_COLLECTION_NAME = "document_terms"
 TERM_DEFINITION_MIN_LEN = 10      # Minimum chars for a definition body to be kept
 TERM_ACRONYM_MAX_LEN = 10         # Maximum chars in an acronym (skips long all-caps phrases)
-
-# Term definition extraction
-TERM_COLLECTION_NAME = "document_terms"
-TERM_DEFINITION_MIN_LEN = 10      # Minimum chars for a definition body to be kept
-TERM_ACRONYM_MAX_LEN = 10         # Maximum chars in an acronym (skips long all-caps phrases)

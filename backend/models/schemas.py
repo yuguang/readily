@@ -58,23 +58,6 @@ class ComplianceRequirement(Requirement):
 
 
 class TermDefinition(BaseModel):
-    """A term or acronym definition extracted from a source document.
-
-    Produced by the compliance extractor (Component 8) and stored in the
-    ``document_terms`` ChromaDB collection so the Question Agent can expand
-    acronyms before searching the policy corpus.
-    """
-
-    term: str                          # Full term, e.g. "Enhanced Care Management"
-    abbreviation: str | None = None    # Acronym/short form, e.g. "ECM"
-    definition: str                    # Verbatim or lightly cleaned definition text
-    source_file: str                   # Path to the source PDF
-    page_number: int                   # Page where the definition appears
-    section_heading: str | None = None # e.g. "Appendix C: Definitions for..."
-    source: str = "inline_acronym"     # "glossary" | "appendix" | "inline_acronym" | "definition_table"
-
-
-class TermDefinition(BaseModel):
     """A program-specific term or acronym definition extracted from a source PDF.
 
     Stored in the ``document_terms`` ChromaDB collection for cheap lookup by

@@ -50,6 +50,7 @@ from backend.config import (
     GEMINI_API_KEY,
     OPENAI_API_KEY,
     COMPLIANCE_MAX_CONCURRENT_WORKERS,
+    WORKER_TIMEOUT_SECONDS,
 )
 from backend.models.schemas import ComplianceRequirement, Requirement
 from backend.tools.nested_list_parser import ParseNestedListTool
@@ -707,17 +708,65 @@ def run_section_extractor(
 # ---------------------------------------------------------------------------
 
 
+async def _run_section_with_timeout(
+    section: DocumentSection,
+    section_index: SectionIndex | None = None,
+    hf_filter: HeaderFooterFilter | None = None,
+    timeout_seconds: float = WORKER_TIMEOUT_SECONDS,
+) -> list[ComplianceRequirement]:
+    """
+    Run :func:`run_section_extractor` in a worker thread with a wall-clock timeout.
+
+    If the LLM call (or any tool call) blocks longer than *timeout_seconds*,
+    the surrounding ``asyncio`` task is released with an empty result so the
+    overall pipeline can continue instead of hanging forever on a single
+    stuck section.  The underlying thread may still be running — Python cannot
+    forcibly kill threads blocked in C extensions / network I/O — but it no
+    longer blocks ``asyncio.as_completed`` from advancing.
+
+    Args:
+        section:         The section to extract from.
+        section_index:   Cross-reference index for the full document.
+        hf_filter:       Header/footer filter for the full document.
+        timeout_seconds: Wall-clock timeout per section.  Defaults to
+                         :data:`~backend.config.WORKER_TIMEOUT_SECONDS`.
+
+    Returns:
+        Extracted requirements, or ``[]`` on timeout / thread error.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                run_section_extractor, section, section_index, hf_filter
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Section %r: extraction timed out after %ss; skipping.",
+            section.heading,
+            timeout_seconds,
+        )
+        return []
+
+
 async def extract_from_all_sections(
     sections: list[DocumentSection],
+    section_index: SectionIndex | None = None,
+    hf_filter: HeaderFooterFilter | None = None,
 ) -> list[ComplianceRequirement]:
     """
     Extract compliance requirements from all sections concurrently.
 
-    Uses a semaphore to cap parallelism at ``COMPLIANCE_MAX_CONCURRENT_WORKERS``.
+    Uses a semaphore to cap parallelism at ``COMPLIANCE_MAX_CONCURRENT_WORKERS``
+    and wraps each worker in :func:`_run_section_with_timeout` so a single
+    stuck LLM call cannot stall the whole pipeline.
     Each section runs in a thread via :func:`asyncio.to_thread`.
 
     Args:
-        sections: Obligation-bearing sections from the filtering step.
+        sections:      Obligation-bearing sections from the filtering step.
+        section_index: Pre-built cross-reference index for the full document.
+        hf_filter:     Pre-built header/footer filter for the full document.
 
     Returns:
         Flat list of all extracted :class:`ComplianceRequirement` objects.
@@ -726,7 +775,9 @@ async def extract_from_all_sections(
 
     async def extract_one(section: DocumentSection) -> list[ComplianceRequirement]:
         async with semaphore:
-            return await asyncio.to_thread(run_section_extractor, section)
+            return await _run_section_with_timeout(
+                section, section_index, hf_filter, WORKER_TIMEOUT_SECONDS,
+            )
 
     tasks = [asyncio.create_task(extract_one(s)) for s in sections]
     all_reqs: list[ComplianceRequirement] = []
@@ -1101,8 +1152,8 @@ async def run_compliance_extractor_with_progress(
 
     async def _extract_one(section: DocumentSection) -> list[ComplianceRequirement]:
         async with semaphore:
-            return await asyncio.to_thread(
-                run_section_extractor, section, section_index, hf_filter
+            return await _run_section_with_timeout(
+                section, section_index, hf_filter, WORKER_TIMEOUT_SECONDS,
             )
 
     tasks = [asyncio.create_task(_extract_one(s)) for s in obligation_sections]

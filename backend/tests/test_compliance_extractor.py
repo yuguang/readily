@@ -15,7 +15,10 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,8 +28,10 @@ from backend.agents.compliance_extractor import (
     ResolveCrossReferenceTool,
     StripHeadersFootersTool,
     _parse_compliance_requirements,
+    _run_section_with_timeout,
     assemble_hierarchy,
     deduplicate_requirements,
+    extract_from_all_sections,
     extract_table_requirements,
     finalize_requirements,
 )
@@ -979,3 +984,260 @@ class TestUpsertTermDefinitions:
         metadatas = call_kwargs.kwargs.get("metadatas") or call_kwargs.args[2]
         for meta in metadatas:
             assert None not in meta.values(), "Metadata must not contain None values"
+
+
+# ===========================================================================
+# _run_section_with_timeout / extract_from_all_sections
+# ---------------------------------------------------------------------------
+# Regression coverage for the "Step 5/8 stuck at 52/54 sections" bug.
+#
+# Prior to the fix the per-section worker was dispatched via
+# `asyncio.to_thread(run_section_extractor, ...)` with no surrounding
+# `asyncio.wait_for`, so a single stalled LLM call hung the entire pipeline:
+# `asyncio.as_completed` could never advance past the stuck task.
+#
+# These tests patch `run_section_extractor` with a synthetic blocking
+# implementation and assert that:
+#   1. A single hanging section times out and returns [] instead of hanging.
+#   2. `extract_from_all_sections` completes even when some sections block
+#      forever, returning results from the healthy sections.
+# ===========================================================================
+
+
+class TestRunSectionWithTimeout:
+    """Unit-level coverage of the per-section timeout helper."""
+
+    def test_fast_section_returns_results(self):
+        """A fast worker returns its results unchanged (no timeout path)."""
+        section = _make_section(heading="Fast Section")
+        expected = [_make_req(text="Does the P&P state that MCPs must train?")]
+
+        with patch(
+            "backend.agents.compliance_extractor.run_section_extractor",
+            return_value=expected,
+        ) as mock_extractor:
+            result = asyncio.run(
+                _run_section_with_timeout(section, None, None, timeout_seconds=5.0)
+            )
+
+        assert result == expected
+        mock_extractor.assert_called_once()
+
+    def test_stuck_section_times_out_and_returns_empty(self):
+        """A worker that blocks past the timeout must yield [] instead of hanging."""
+        section = _make_section(heading="Stuck Section")
+        # A real smolagents/LLM hang manifests as a blocking call inside the
+        # worker thread.  The release event lets us unblock the thread once
+        # the coroutine has returned so that the asyncio event loop can tear
+        # down without waiting the full safety-net duration on its default
+        # executor.  We measure elapsed time INSIDE the coroutine because
+        # `asyncio.run()` waits for the threadpool to drain during shutdown —
+        # a concern that does not affect production where the event loop
+        # keeps running and simply advances past the stuck task.
+        release = threading.Event()
+
+        def blocking_extractor(*args, **kwargs):
+            release.wait(timeout=10.0)
+            return []
+
+        elapsed: dict[str, float] = {}
+
+        async def run_and_measure():
+            start = time.monotonic()
+            result = await _run_section_with_timeout(
+                section, None, None, timeout_seconds=0.1
+            )
+            elapsed["value"] = time.monotonic() - start
+            # Release the blocked thread now that we've measured the
+            # coroutine's return time; this keeps event-loop teardown fast.
+            release.set()
+            return result
+
+        try:
+            with patch(
+                "backend.agents.compliance_extractor.run_section_extractor",
+                side_effect=blocking_extractor,
+            ):
+                result = asyncio.run(run_and_measure())
+        finally:
+            release.set()
+
+        assert result == []
+        # The coroutine itself must return promptly after the timeout, not
+        # block on the stuck thread.  Without `asyncio.wait_for` around
+        # `asyncio.to_thread`, this would be >10s.
+        assert elapsed["value"] < 1.0, (
+            f"Timeout path took {elapsed['value']:.2f}s inside the coroutine; "
+            "expected <1s. The asyncio.wait_for wrapper is likely missing."
+        )
+
+
+class TestExtractFromAllSectionsTimeout:
+    """Regression test: one stuck section must not stall the whole pipeline."""
+
+    def test_stuck_section_does_not_stall_pipeline(self):
+        """
+        Simulate the production symptom: 1 of 3 sections hangs indefinitely.
+
+        With the fix, the async pipeline must still complete and yield the
+        results from the 2 healthy sections.  Without the fix, this test
+        hangs until the test runner's own timeout kicks in.
+
+        Elapsed time is measured INSIDE the coroutine because
+        ``asyncio.run`` waits for default-executor threads to drain at
+        shutdown — a teardown artefact that does not represent production
+        behaviour (the production event loop keeps running past stuck tasks).
+        """
+        sections = [
+            _make_section(heading="Fast Section 1"),
+            _make_section(heading="Stuck Section"),
+            _make_section(heading="Fast Section 2"),
+        ]
+        release = threading.Event()
+
+        def side_effect(section, section_index=None, hf_filter=None):
+            if section.heading == "Stuck Section":
+                # Simulate a hung LLM call: block until the test releases us.
+                release.wait(timeout=10.0)
+                return []
+            return [
+                _make_req(
+                    text=f"Does the P&P state that {section.heading}?",
+                    section_heading=section.heading,
+                )
+            ]
+
+        elapsed: dict[str, float] = {}
+
+        async def run_and_measure():
+            start = time.monotonic()
+            results = await extract_from_all_sections(sections)
+            elapsed["value"] = time.monotonic() - start
+            # Release the stuck thread so loop teardown is fast.
+            release.set()
+            return results
+
+        try:
+            with (
+                patch(
+                    "backend.agents.compliance_extractor.WORKER_TIMEOUT_SECONDS",
+                    0.2,
+                ),
+                patch(
+                    "backend.agents.compliance_extractor.run_section_extractor",
+                    side_effect=side_effect,
+                ),
+            ):
+                results = asyncio.run(
+                    asyncio.wait_for(run_and_measure(), timeout=10.0)
+                )
+        finally:
+            release.set()
+
+        # The two healthy sections must have produced requirements; the stuck
+        # one contributes nothing because it timed out.
+        headings = {r.section_heading for r in results}
+        assert headings == {"Fast Section 1", "Fast Section 2"}
+        assert len(results) == 2
+        # The pipeline coroutine itself must complete roughly on the
+        # timeout boundary (0.2s), not wait for the 10s thread-release
+        # safety net.  Prior to the fix this would be >10s.
+        assert elapsed["value"] < 2.0, (
+            f"Pipeline coroutine took {elapsed['value']:.2f}s; expected <2s "
+            "with a 0.2s per-section timeout. Regression in timeout wrapper."
+        )
+
+    def test_progress_advances_past_stuck_section(self):
+        """
+        Streaming pipeline must emit a progress event for every section,
+        including stuck ones (which contribute [] via the timeout path).
+
+        This test exercises `run_compliance_extractor_with_progress` directly
+        so the SSE frontend's "X / N sections" counter is proven to advance.
+        """
+        from backend.agents import compliance_extractor as mod
+
+        sections = [
+            _make_section(heading="Fast 1", text="MCPs must train staff."),
+            _make_section(heading="Stuck", text="Providers must report issues."),
+            _make_section(heading="Fast 2", text="The MCP shall maintain records."),
+        ]
+        release = threading.Event()
+
+        def side_effect(section, section_index=None, hf_filter=None):
+            if section.heading == "Stuck":
+                release.wait(timeout=5.0)
+                return []
+            return [
+                _make_req(
+                    text=f"Does the P&P describe {section.heading}?",
+                    section_heading=section.heading,
+                )
+            ]
+
+        async def collect_events():
+            events = []
+            async for event in mod.run_compliance_extractor_with_progress(
+                "/tmp/fake.pdf"
+            ):
+                events.append(event)
+            return events
+
+        async def collect_and_release():
+            # Release the stuck thread once we've finished iterating so the
+            # default executor can drain quickly at event-loop shutdown.
+            try:
+                return await collect_events()
+            finally:
+                release.set()
+
+        try:
+            with (
+                patch.object(mod, "WORKER_TIMEOUT_SECONDS", 0.2),
+                patch.object(
+                    mod, "build_hf_filter_from_pdf", return_value=None
+                ),
+                patch.object(
+                    mod,
+                    "parse_pdf_with_structure",
+                    return_value="[PAGE 1]\nBody text.",
+                ),
+                patch.object(mod, "segment_document", return_value=sections),
+                patch.object(
+                    mod, "filter_obligation_sections",
+                    return_value=(sections, []),
+                ),
+                patch.object(
+                    mod, "extract_term_definitions", return_value=[]
+                ),
+                patch.object(mod, "upsert_term_definitions"),
+                patch.object(mod, "deduplicate_requirements", side_effect=lambda r: r),
+                patch.object(
+                    mod, "run_section_extractor", side_effect=side_effect
+                ),
+            ):
+                events = asyncio.run(
+                    asyncio.wait_for(collect_and_release(), timeout=10.0)
+                )
+        finally:
+            release.set()
+
+        # Collect the sub-progress events for Step 5.
+        step5 = [
+            e for e in events
+            if e.get("type") == "progress" and e.get("step_number") == 5
+        ]
+        completions = [
+            e["sections_completed"] for e in step5
+            if "sections_completed" in e
+        ]
+        # Counter must reach the total (3/3) — this is what the frontend's
+        # progress bar reads.  Prior to the fix it stopped at 2/3.
+        assert completions and max(completions) == len(sections)
+
+        # Pipeline must emit a final "complete" event.
+        complete_events = [e for e in events if e.get("type") == "complete"]
+        assert len(complete_events) == 1
+        final = complete_events[0]
+        # The two healthy sections produced one requirement each.
+        assert final["total_requirements"] == 2
