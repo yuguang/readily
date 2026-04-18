@@ -38,13 +38,15 @@ from tenacity import (
 import numpy as np
 from pydantic import ValidationError
 from sentence_transformers import SentenceTransformer
-from smolagents import LiteLLMModel, OpenAIModel, Tool, ToolCallingAgent
+from smolagents import OpenAIModel, Tool, ToolCallingAgent
 
 from backend.config import (
     COMPLIANCE_LLM_API_BASE,
     COMPLIANCE_LLM_MODEL_ID,
     DEDUP_SIMILARITY_THRESHOLD,
     EMBEDDING_MODEL,
+    GEMINI_API_BASE,
+    GEMINI_API_KEY,
     OPENAI_API_KEY,
     COMPLIANCE_MAX_CONCURRENT_WORKERS,
 )
@@ -584,25 +586,29 @@ def _is_retryable(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _make_model() -> LiteLLMModel | OpenAIModel:
+def _make_model() -> OpenAIModel:
     """Build the LLM model for compliance extraction.
 
-    Uses :class:`~smolagents.LiteLLMModel` for Gemini models (when
-    :data:`~backend.config.COMPLIANCE_LLM_MODEL_ID` starts with "gemini/").
+    For Gemini models (``COMPLIANCE_LLM_MODEL_ID`` starting with ``"gemini/"``)
+    the model is routed through the Gemini OpenAI-compatible endpoint using
+    :class:`~smolagents.OpenAIModel`.  This avoids the Pydantic v2
+    serialization warnings produced by :class:`~smolagents.LiteLLMModel`.
 
-    Uses :class:`~smolagents.OpenAIModel` for OpenAI and other models
-    (default ``gpt-4.1-mini``). Set ``COMPLIANCE_LLM_API_BASE`` to route
-    through an OpenAI-compatible endpoint.
+    For all other models, :class:`~smolagents.OpenAIModel` is used with the
+    OpenAI API (or a custom ``COMPLIANCE_LLM_API_BASE`` endpoint).
     """
-    # Check if using a Gemini model (identified by "gemini/" prefix)
     if COMPLIANCE_LLM_MODEL_ID.startswith("gemini/"):
-        return LiteLLMModel(
-            model_id=COMPLIANCE_LLM_MODEL_ID,
+        # Strip the litellm-style "gemini/" provider prefix — OpenAIModel
+        # talks directly to the Gemini OpenAI-compatible REST endpoint.
+        model_id = COMPLIANCE_LLM_MODEL_ID.removeprefix("gemini/")
+        return OpenAIModel(
+            model_id=model_id,
+            api_key=GEMINI_API_KEY,
+            api_base=GEMINI_API_BASE,
             temperature=0.2,
-            requests_per_minute=60
         )
 
-    # Default: use OpenAIModel for OpenAI and other providers
+    # Default: OpenAI (or a custom OpenAI-compatible endpoint)
     kwargs: dict[str, Any] = {
         "model_id": COMPLIANCE_LLM_MODEL_ID,
         "api_key": OPENAI_API_KEY,

@@ -10,14 +10,15 @@ from __future__ import annotations
 import functools
 
 import chromadb
-import litellm
+import openai
 from smolagents import tool
 
 from backend.config import (
     CHROMA_DIR,
     COLLECTION_NAME,
+    GEMINI_API_BASE,
     GEMINI_API_KEY,
-    LITELLM_MODEL_ID,
+    LLM_MODEL_ID,
 )
 
 
@@ -30,6 +31,12 @@ from backend.config import (
 def _get_chroma_client() -> chromadb.PersistentClient:
     """Return a cached ChromaDB persistent client."""
     return chromadb.PersistentClient(path=str(CHROMA_DIR))
+
+
+@functools.lru_cache(maxsize=1)
+def _get_openai_client() -> openai.OpenAI:
+    """Return a cached OpenAI client pointed at the Gemini-compatible endpoint."""
+    return openai.OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_API_BASE)
 
 
 def get_chroma_collection() -> chromadb.Collection:
@@ -101,9 +108,9 @@ def evaluate_citation(requirement: str, passage: str) -> str:
         '"reasoning": "<brief explanation>"}'
     )
 
-    response = litellm.completion(
-        model=LITELLM_MODEL_ID,
-        api_key=GEMINI_API_KEY,
+    client = _get_openai_client()
+    response = client.chat.completions.create(
+        model=LLM_MODEL_ID,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
     )

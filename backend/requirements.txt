@@ -6,7 +6,6 @@ sse-starlette==2.1.0
 
 # AI / Agents
 smolagents[toolkit]==1.24.0
-litellm==1.50.0
 google-generativeai>=0.8.0
 
 # Vector store & embeddings

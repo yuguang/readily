@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 # Stub out heavy dependencies that may not be installed in the dev venv
 # ---------------------------------------------------------------------------
 
-for _mod_name in ["chromadb", "litellm"]:
+for _mod_name in ["chromadb"]:
     if _mod_name not in sys.modules and importlib.util.find_spec(_mod_name) is None:
         sys.modules[_mod_name] = MagicMock()
 
