@@ -38,7 +38,7 @@ from tenacity import (
 import numpy as np
 from pydantic import ValidationError
 from sentence_transformers import SentenceTransformer
-from smolagents import OpenAIModel, Tool, ToolCallingAgent
+from smolagents import LiteLLMModel, OpenAIModel, Tool, ToolCallingAgent
 
 from backend.config import (
     COMPLIANCE_LLM_API_BASE,
@@ -584,14 +584,25 @@ def _is_retryable(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _make_model() -> OpenAIModel:
-    """Build the :class:`~smolagents.OpenAIModel` for compliance extraction.
+def _make_model() -> LiteLLMModel | OpenAIModel:
+    """Build the LLM model for compliance extraction.
 
-    Uses :data:`~backend.config.COMPLIANCE_LLM_MODEL_ID` (default
-    ``gpt-4.1-mini``) and :data:`~backend.config.OPENAI_API_KEY`.
-    Set ``COMPLIANCE_LLM_API_BASE`` to route through an OpenAI-compatible
-    endpoint instead (e.g. the Gemini base URL).
+    Uses :class:`~smolagents.LiteLLMModel` for Gemini models (when
+    :data:`~backend.config.COMPLIANCE_LLM_MODEL_ID` starts with "gemini/").
+
+    Uses :class:`~smolagents.OpenAIModel` for OpenAI and other models
+    (default ``gpt-4.1-mini``). Set ``COMPLIANCE_LLM_API_BASE`` to route
+    through an OpenAI-compatible endpoint.
     """
+    # Check if using a Gemini model (identified by "gemini/" prefix)
+    if COMPLIANCE_LLM_MODEL_ID.startswith("gemini/"):
+        return LiteLLMModel(
+            model_id=COMPLIANCE_LLM_MODEL_ID,
+            temperature=0.2,
+            requests_per_minute=60
+        )
+
+    # Default: use OpenAIModel for OpenAI and other providers
     kwargs: dict[str, Any] = {
         "model_id": COMPLIANCE_LLM_MODEL_ID,
         "api_key": OPENAI_API_KEY,

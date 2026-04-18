@@ -22,7 +22,7 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # Override via env vars to use a different model or provider.
 # Set COMPLIANCE_LLM_API_BASE to a non-empty string to route through a
 # custom OpenAI-compatible endpoint (e.g. the Gemini base URL above).
-COMPLIANCE_LLM_MODEL_ID = os.getenv("COMPLIANCE_LLM_MODEL_ID", "gpt-5.4-mini")  # override with e.g. gpt-4.1, gpt-4.1-mini, gpt-4o-mini
+COMPLIANCE_LLM_MODEL_ID = os.getenv("COMPLIANCE_LLM_MODEL_ID", "gemini/gemini-flash-latest")  # override with e.g. gpt-4.1, gpt-4.1-mini, gpt-4o-mini
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 COMPLIANCE_LLM_API_BASE = os.getenv("COMPLIANCE_LLM_API_BASE", "")  # empty = OpenAI default
 
