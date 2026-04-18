@@ -17,7 +17,7 @@ from smolagents import OpenAIModel, ToolCallingAgent
 
 from backend.config import GEMINI_API_BASE, GEMINI_API_KEY, LLM_MODEL_ID
 from backend.models.schemas import AnswerType, Evaluation, Requirement
-from backend.tools.policy_search import evaluate_citation, search_policies
+from backend.tools.policy_search import define_term, evaluate_citation, search_policies
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +32,18 @@ You are a healthcare compliance reviewer. You are given ONE compliance requireme
 
 Your job:
 1. Read the requirement carefully. Identify the key regulatory concepts.
-2. Generate 2-3 search queries that would find the relevant policy section.
+2. If the requirement text contains an acronym or program term you are not 100%
+   sure about (e.g. "ECM", "POF", "MCP", "SUD", "I/DD", "TBI"), call
+   `define_term` with that term BEFORE searching. Use the returned definition
+   to formulate better, concept-level search queries.
+3. Generate 2-3 search queries that would find the relevant policy section.
    - Use specific regulatory terms from the requirement.
-   - Try variations: acronyms, full names, related concepts.
-3. Call `search_policies` with each query.
-4. From the returned passages, identify the one that best answers the requirement.
-5. Determine: does this passage satisfy the requirement? Answer YES, NO, or PARTIAL.
-6. Return your answer using `final_answer` with this exact JSON structure:
+   - Try variations: acronyms, full names (from the definition you looked up),
+     and related concepts.
+4. Call `search_policies` with each query.
+5. From the returned passages, identify the one that best answers the requirement.
+6. Determine: does this passage satisfy the requirement? Answer YES, NO, or PARTIAL.
+7. Return your answer using `final_answer` with this exact JSON structure:
    {
      "answer": "yes" | "no" | "partial",
      "citation_text": "exact quoted text from the policy",
@@ -51,7 +56,10 @@ Your job:
 IMPORTANT:
 - Only cite text that ACTUALLY appears in the retrieved passages. Never fabricate.
 - If no passage adequately addresses the requirement, answer "no" with low confidence.
-- A "partial" answer means the policy addresses the topic but misses specific details.\
+- A "partial" answer means the policy addresses the topic but misses specific details.
+- Term definitions from `define_term` are reference material ONLY — never cite them
+  as the `citation_text` for a YES/NO/PARTIAL answer. Citations must come from
+  `search_policies` results.\
 """
 
 
@@ -82,7 +90,7 @@ def get_model() -> OpenAIModel:
 def create_question_agent(model: OpenAIModel) -> ToolCallingAgent:
     """Create a fresh ToolCallingAgent for evaluating one compliance requirement."""
     return ToolCallingAgent(
-        tools=[search_policies, evaluate_citation],
+        tools=[search_policies, define_term, evaluate_citation],
         model=model,
         max_steps=8,
         name="question_reviewer",

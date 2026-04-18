@@ -11,14 +11,17 @@ import functools
 
 import chromadb
 import openai
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from smolagents import tool
 
 from backend.config import (
     CHROMA_DIR,
     COLLECTION_NAME,
+    EMBEDDING_MODEL,
     GEMINI_API_BASE,
     GEMINI_API_KEY,
     LLM_MODEL_ID,
+    TERM_COLLECTION_NAME,
 )
 
 
@@ -42,6 +45,16 @@ def _get_openai_client() -> openai.OpenAI:
 def get_chroma_collection() -> chromadb.Collection:
     """Return the ChromaDB collection containing ingested policy documents."""
     return _get_chroma_client().get_collection(name=COLLECTION_NAME)
+
+
+def _get_term_collection() -> chromadb.Collection:
+    """Return (or lazily create) the ChromaDB collection for term definitions."""
+    return _get_chroma_client().get_or_create_collection(
+        name=TERM_COLLECTION_NAME,
+        embedding_function=SentenceTransformerEmbeddingFunction(
+            model_name=EMBEDDING_MODEL,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +97,61 @@ def search_policies(query: str, top_k: int = 10) -> str:
         return "No relevant passages found in the policy corpus."
 
     return "\n---\n".join(formatted)
+
+
+@tool
+def define_term(term: str, top_k: int = 3) -> str:
+    """
+    Look up the definition of a term or acronym extracted from the source document.
+
+    Use this when the compliance requirement contains an unfamiliar acronym
+    (e.g. "ECM", "POF") or program-specific term (e.g. "Population of Focus").
+    The returned definition can be used to formulate better policy search queries.
+
+    Args:
+        term: The term or acronym to define (case-insensitive).
+        top_k: Maximum number of candidate definitions to return (default 3).
+
+    Returns:
+        A formatted string of matching definitions, each with the term,
+        abbreviation, definition text, source file, page number, and section
+        heading. Returns "No definition found for '<term>'." if nothing matches.
+    """
+    collection = _get_term_collection()
+
+    # 1. Exact metadata match on abbreviation (case-insensitive) or full term.
+    exact = collection.get(
+        where={"$or": [
+            {"abbreviation": term.upper()},
+            {"abbreviation": term},
+            {"term": term},
+        ]},
+    )
+    if exact["ids"]:
+        return _format_definitions(exact["metadatas"])
+
+    # 2. Fall back to embedding similarity search.
+    results = collection.query(query_texts=[term], n_results=top_k)
+    if not results["ids"] or not results["ids"][0]:
+        return f"No definition found for '{term}'."
+    return _format_definitions(results["metadatas"][0])
+
+
+def _format_definitions(metadatas: list[dict]) -> str:
+    """Format a list of term-definition metadata dicts into a human-readable string."""
+    lines = []
+    for meta in metadatas:
+        abbr = f" ({meta['abbreviation']})" if meta.get("abbreviation") else ""
+        section = meta.get("section_heading") or ""
+        source = f"{meta.get('source_file', '')}, page {meta.get('page_number', '?')}"
+        if section:
+            source = f"{section} — {source}"
+        lines.append(
+            f"[{meta['term']}{abbr}]\n"
+            f"Definition: {meta['definition']}\n"
+            f"Source: {source}"
+        )
+    return "\n---\n".join(lines)
 
 
 @tool

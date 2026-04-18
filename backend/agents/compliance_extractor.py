@@ -6,11 +6,12 @@ A specialized extraction pipeline for long regulatory PDFs (>20 pages).
 Pipeline:
   1. Structured PDF parse with heading/table markers
   2. Section segmentation
-  3. Obligation-language filtering
-  4. Per-section LLM extraction (parallelized)
-  5. Embedding-based deduplication
-  6. Hierarchy assembly
-  7. ID assignment and final output
+  3. Term definition extraction (rule-based; persists to ``document_terms``)
+  4. Obligation-language filtering
+  5. Per-section LLM extraction (parallelized)
+  6. Embedding-based deduplication
+  7. Hierarchy assembly
+  8. ID assignment and final output
 
 Entry point: :func:`run_compliance_extractor`.
 """
@@ -61,6 +62,7 @@ from backend.tools.document_segmenter import (
     filter_obligation_sections,
     segment_document,
 )
+from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
 from backend.tools.header_footer_stripper import (
     HeaderFooterFilter,
     _normalize_signature,
@@ -1030,7 +1032,7 @@ async def run_compliance_extractor_with_progress(
     Yields:
         Progress and completion events as plain ``dict`` objects.
     """
-    _steps = 7
+    _steps = 8
 
     def _prog(step: str, step_number: int, detail: str, **extra: Any) -> dict:
         return {"type": "progress", "step": step, "step_number": step_number,
@@ -1045,7 +1047,7 @@ async def run_compliance_extractor_with_progress(
     structured_text = parse_pdf_with_structure(pdf_path, hf_filter=hf_filter)
     if not structured_text.strip():
         logger.warning("Compliance extractor: no text extracted from %s.", pdf_path)
-        yield {"type": "complete", "requirements": [], "total_requirements": 0}
+        yield {"type": "complete", "requirements": [], "total_requirements": 0, "term_count": 0}
         return
 
     # Step 2: Segment
@@ -1054,11 +1056,21 @@ async def run_compliance_extractor_with_progress(
     yield _prog("segmenting", 2, f"Found {len(sections)} sections")
     logger.info("Compliance extractor: %d sections found.", len(sections))
 
-    # Step 3: Filter
-    yield _prog("filtering", 3, "Filtering for obligation language...")
+    # Step 3: Extract term definitions (rule-based; persist to document_terms collection)
+    yield _prog("term_extraction", 3, "Extracting term definitions and acronyms...")
+    terms = extract_term_definitions(structured_text, sections, source_file=pdf_path)
+    upsert_term_definitions(terms)
+    yield _prog(
+        "term_extraction", 3,
+        f"Indexed {len(terms)} term definitions",
+    )
+    logger.info("Compliance extractor: indexed %d term definitions from %s.", len(terms), pdf_path)
+
+    # Step 4: Filter
+    yield _prog("filtering", 4, "Filtering for obligation language...")
     obligation_sections, skipped = filter_obligation_sections(sections)
     yield _prog(
-        "filtering", 3,
+        "filtering", 4,
         f"{len(obligation_sections)} of {len(sections)} sections contain obligation language",
     )
     logger.info(
@@ -1068,7 +1080,7 @@ async def run_compliance_extractor_with_progress(
 
     if not obligation_sections:
         logger.warning("Compliance extractor: no obligation sections found in %s.", pdf_path)
-        yield {"type": "complete", "requirements": [], "total_requirements": 0}
+        yield {"type": "complete", "requirements": [], "total_requirements": 0, "term_count": len(terms)}
         return
 
     # Build cross-reference index from all segments for context injection
@@ -1078,9 +1090,9 @@ async def run_compliance_extractor_with_progress(
         len(section_index),
     )
 
-    # Step 4: Parallel per-section extraction with sub-progress
+    # Step 5: Parallel per-section extraction with sub-progress
     yield _prog(
-        "extracting", 4, "Extracting requirements from sections...",
+        "extracting", 5, "Extracting requirements from sections...",
         sections_completed=0, sections_total=len(obligation_sections),
     )
     raw_requirements: list[ComplianceRequirement] = []
@@ -1099,7 +1111,7 @@ async def run_compliance_extractor_with_progress(
         raw_requirements.extend(section_reqs)
         completed += 1
         yield _prog(
-            "extracting", 4, "Extracting requirements from sections...",
+            "extracting", 5, "Extracting requirements from sections...",
             sections_completed=completed, sections_total=len(obligation_sections),
         )
 
@@ -1107,14 +1119,14 @@ async def run_compliance_extractor_with_progress(
 
     if not raw_requirements:
         logger.warning("Compliance extractor: zero requirements from %s.", pdf_path)
-        yield {"type": "complete", "requirements": [], "total_requirements": 0}
+        yield {"type": "complete", "requirements": [], "total_requirements": 0, "term_count": len(terms)}
         return
 
-    # Step 5: Deduplicate
-    yield _prog("deduplicating", 5, f"Deduplicating {len(raw_requirements)} requirements...")
+    # Step 6: Deduplicate
+    yield _prog("deduplicating", 6, f"Deduplicating {len(raw_requirements)} requirements...")
     deduped = deduplicate_requirements(raw_requirements)
     yield _prog(
-        "deduplicating", 5,
+        "deduplicating", 6,
         f"Deduplicated {len(raw_requirements)} \u2192 {len(deduped)} requirements",
     )
     logger.info(
@@ -1122,18 +1134,19 @@ async def run_compliance_extractor_with_progress(
         len(raw_requirements), len(deduped),
     )
 
-    # Step 6: Hierarchy
-    yield _prog("hierarchy", 6, "Assembling requirement hierarchy")
+    # Step 7: Hierarchy
+    yield _prog("hierarchy", 7, "Assembling requirement hierarchy")
     with_hierarchy = assemble_hierarchy(deduped, sections)
 
-    # Step 7: Finalize
-    yield _prog("finalizing", 7, "Assigning IDs")
+    # Step 8: Finalize
+    yield _prog("finalizing", 8, "Assigning IDs")
     final = finalize_requirements(with_hierarchy)
 
     yield {
         "type": "complete",
         "requirements": [r.model_dump() for r in final],
         "total_requirements": len(final),
+        "term_count": len(terms),
     }
 
 

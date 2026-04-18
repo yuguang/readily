@@ -53,3 +53,13 @@ COLLECTION_NAME = "policy_documents"
 # Compliance extraction (Component 8)
 SECTION_MAX_CHARS = 5000          # Max chars per section before sub-splitting
 DEDUP_SIMILARITY_THRESHOLD = 0.90
+
+# Term definition extraction
+TERM_COLLECTION_NAME = "document_terms"
+TERM_DEFINITION_MIN_LEN = 10      # Minimum chars for a definition body to be kept
+TERM_ACRONYM_MAX_LEN = 10         # Maximum chars in an acronym (skips long all-caps phrases)
+
+# Term definition extraction
+TERM_COLLECTION_NAME = "document_terms"
+TERM_DEFINITION_MIN_LEN = 10      # Minimum chars for a definition body to be kept
+TERM_ACRONYM_MAX_LEN = 10         # Maximum chars in an acronym (skips long all-caps phrases)

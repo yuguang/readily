@@ -7,7 +7,7 @@ logs/
 *.zip
 
 # ChromaDB
-chroma.sqlite3
+chroma_db/
 
 # Python
 __pycache__/

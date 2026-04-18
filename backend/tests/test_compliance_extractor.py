@@ -30,12 +30,18 @@ from backend.agents.compliance_extractor import (
     extract_table_requirements,
     finalize_requirements,
 )
-from backend.models.schemas import ComplianceRequirement
+from backend.models.schemas import ComplianceRequirement, TermDefinition
 from backend.tools.document_segmenter import (
     DocumentSection,
     OBLIGATION_PATTERNS,
     filter_obligation_sections,
     segment_document,
+)
+from backend.tools.term_extractor import (
+    _initials_match,
+    _parse_pipe_table,
+    extract_term_definitions,
+    upsert_term_definitions,
 )
 
 
@@ -725,3 +731,251 @@ class TestExtractTableRequirements:
             result = extract_table_requirements(table, "Unknown Table", 1)
         mock_fn.assert_called_once()
         assert result == mock_reqs
+
+
+# ===========================================================================
+# _initials_match (term_extractor helper)
+# ===========================================================================
+
+
+class TestInitialsMatch:
+    def test_ecm_matches(self):
+        assert _initials_match("Enhanced Care Management", "ECM")
+
+    def test_pof_matches_with_stop_word(self):
+        assert _initials_match("Population of Focus", "POF")
+
+    def test_mcp_matches(self):
+        assert _initials_match("Managed Care Plan", "MCP")
+
+    def test_case_insensitive_acronym(self):
+        assert _initials_match("Enhanced Care Management", "ecm")
+
+    def test_unrelated_phrase_does_not_match(self):
+        assert not _initials_match("Random Unrelated Words", "ECM")
+
+    def test_empty_acronym_returns_false(self):
+        assert not _initials_match("Enhanced Care Management", "")
+
+    def test_empty_phrase_returns_false(self):
+        assert not _initials_match("", "ECM")
+
+
+# ===========================================================================
+# _parse_pipe_table (term_extractor helper)
+# ===========================================================================
+
+
+class TestParsePipeTable:
+    def test_parses_headers_and_rows(self):
+        table = "| Term | Definition |\n| ECM | Enhanced Care Management |"
+        headers, rows = _parse_pipe_table(table)
+        assert headers == ["term", "definition"]
+        assert rows == [["ECM", "Enhanced Care Management"]]
+
+    def test_empty_string_returns_empty(self):
+        headers, rows = _parse_pipe_table("")
+        assert headers == []
+        assert rows == []
+
+    def test_multi_row_table(self):
+        table = (
+            "| Criteria | Definition |\n"
+            "| Mental Illness | A serious mental disorder... |\n"
+            "| SUD | Substance Use Disorder |"
+        )
+        headers, rows = _parse_pipe_table(table)
+        assert len(rows) == 2
+        assert rows[0][0] == "Mental Illness"
+
+
+# ===========================================================================
+# extract_term_definitions
+# ===========================================================================
+
+
+class TestExtractTermDefinitions:
+    _SOURCE = "data/test.pdf"
+
+    def test_inline_acronym_detected(self):
+        """A 'Term (ACRONYM)' pattern in the text produces an inline_acronym entry."""
+        text = "[PAGE 1]\nEnhanced Care Management (ECM) is a whole-person approach."
+        sections = [_make_section(heading="Preamble", text=text)]
+        terms = extract_term_definitions(text, sections, self._SOURCE)
+        ecm = next((t for t in terms if t.abbreviation == "ECM"), None)
+        assert ecm is not None, "ECM not found in extracted terms"
+        assert ecm.term == "Enhanced Care Management"
+        assert ecm.source == "inline_acronym"
+
+    def test_case_variant_acronym(self):
+        """Lower-case input acronym string still produces the correct entry."""
+        text = "[PAGE 1]\nPopulation of Focus (POF) members are identified by MCPs."
+        sections = [_make_section(heading="Preamble", text=text)]
+        terms = extract_term_definitions(text, sections, self._SOURCE)
+        pof = next((t for t in terms if t.abbreviation == "POF"), None)
+        assert pof is not None
+        assert pof.term == "Population of Focus"
+
+    def test_glossary_table_produces_entries(self):
+        """A 'Criteria | Definition' two-column table in a Definitions section."""
+        table = (
+            "| Criteria | Definition |\n"
+            "| Mental Illness | A serious mental health condition that substantially limits daily functioning. |"
+        )
+        section = _make_section(
+            heading="Definitions",
+            text="",
+            tables=[table],
+            page_start=10,
+        )
+        terms = extract_term_definitions("", [section], self._SOURCE)
+        mi = next((t for t in terms if t.term == "Mental Illness"), None)
+        assert mi is not None
+        assert mi.source == "glossary"
+        assert mi.page_number == 10
+
+    def test_glossary_wins_over_inline_for_same_term(self):
+        """
+        When both a glossary entry and an inline acronym exist for the same term,
+        the glossary entry should be kept and the inline acronym dropped.
+        """
+        # Glossary section with full definition of ECM
+        table = "| Term | Definition |\n| Enhanced Care Management | A whole-person, interdisciplinary approach. |"
+        glossary_section = _make_section(
+            heading="Definitions",
+            text="",
+            tables=[table],
+            page_start=5,
+        )
+        # Regular section with inline acronym
+        body_text = "[PAGE 2]\nEnhanced Care Management (ECM) services are provided by MCPs."
+        body_section = _make_section(heading="Section I", text=body_text, page_start=2)
+        sections = [glossary_section, body_section]
+
+        terms = extract_term_definitions(body_text, sections, self._SOURCE)
+        ecm_terms = [t for t in terms if "enhanced care management" in t.term.lower()]
+        assert len(ecm_terms) == 1, "Duplicate ECM entries should be deduplicated"
+        assert ecm_terms[0].source == "glossary", "Glossary entry should take precedence"
+
+    def test_miss_returns_empty(self):
+        """A document with no acronyms or glossary produces an empty list."""
+        text = "[PAGE 1]\nThis document contains only plain prose with no special terms."
+        sections = [_make_section(heading="Preamble", text=text)]
+        terms = extract_term_definitions(text, sections, self._SOURCE)
+        assert terms == []
+
+    def test_definition_table_in_regular_section(self):
+        """A 'Term | Definition' table in a non-glossary section is captured."""
+        table = (
+            "| Term | Definition |\n"
+            "| Credentialing | The process of verifying provider qualifications. |"
+        )
+        section = _make_section(
+            heading="Section III Provider Requirements",
+            text="",
+            tables=[table],
+            page_start=20,
+        )
+        terms = extract_term_definitions("", [section], self._SOURCE)
+        cred = next((t for t in terms if t.term == "Credentialing"), None)
+        assert cred is not None
+        assert cred.source == "definition_table"
+
+    def test_no_definitions_no_error(self):
+        """A document with no definitions section and no acronyms returns empty without error."""
+        sections = [
+            _make_section(heading="Section I", text="The MCP must maintain records."),
+        ]
+        terms = extract_term_definitions("The MCP must maintain records.", sections, self._SOURCE)
+        # Should return empty list (no acronyms with matching initials, no glossary)
+        assert isinstance(terms, list)
+
+
+# ===========================================================================
+# upsert_term_definitions
+# ===========================================================================
+
+
+class TestUpsertTermDefinitions:
+    def _make_term(
+        self,
+        term: str = "Enhanced Care Management",
+        abbreviation: str | None = "ECM",
+        definition: str = "A whole-person care approach.",
+        source_file: str = "data/test.pdf",
+        page_number: int = 5,
+    ) -> TermDefinition:
+        return TermDefinition(
+            term=term,
+            abbreviation=abbreviation,
+            definition=definition,
+            source_file=source_file,
+            page_number=page_number,
+            source="glossary",
+        )
+
+    def test_empty_list_is_noop(self):
+        """Calling upsert with an empty list should not touch ChromaDB."""
+        with patch("backend.tools.term_extractor._get_chroma_client") as mock_client:
+            upsert_term_definitions([])
+        mock_client.assert_not_called()
+
+    def test_upsert_calls_collection_upsert(self):
+        """Upsert should call collection.upsert with correct ids and documents."""
+        terms = [self._make_term()]
+        mock_collection = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get_or_create_collection.return_value = mock_collection
+
+        with patch("backend.tools.term_extractor._get_chroma_client", return_value=mock_client):
+            upsert_term_definitions(terms)
+
+        mock_collection.upsert.assert_called_once()
+        call_kwargs = mock_collection.upsert.call_args
+        ids = call_kwargs.kwargs.get("ids") or call_kwargs.args[0]
+        assert ids == ["data/test.pdf::ECM"]
+        documents = call_kwargs.kwargs.get("documents") or call_kwargs.args[1]
+        assert "Enhanced Care Management (ECM)" in documents[0]
+
+    def test_id_uses_abbreviation_when_present(self):
+        """Document ID should use the abbreviation when available."""
+        term = self._make_term(abbreviation="ECM")
+        mock_collection = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get_or_create_collection.return_value = mock_collection
+
+        with patch("backend.tools.term_extractor._get_chroma_client", return_value=mock_client):
+            upsert_term_definitions([term])
+
+        call_kwargs = mock_collection.upsert.call_args
+        ids = call_kwargs.kwargs.get("ids") or call_kwargs.args[0]
+        assert "ECM" in ids[0]
+
+    def test_id_falls_back_to_term_when_no_abbreviation(self):
+        """Document ID should use the term name when abbreviation is None."""
+        term = self._make_term(abbreviation=None)
+        mock_collection = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get_or_create_collection.return_value = mock_collection
+
+        with patch("backend.tools.term_extractor._get_chroma_client", return_value=mock_client):
+            upsert_term_definitions([term])
+
+        call_kwargs = mock_collection.upsert.call_args
+        ids = call_kwargs.kwargs.get("ids") or call_kwargs.args[0]
+        assert "Enhanced Care Management" in ids[0]
+
+    def test_metadata_has_no_none_values(self):
+        """ChromaDB metadata must not contain None values."""
+        term = self._make_term(abbreviation=None)  # section_heading is also None
+        mock_collection = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get_or_create_collection.return_value = mock_collection
+
+        with patch("backend.tools.term_extractor._get_chroma_client", return_value=mock_client):
+            upsert_term_definitions([term])
+
+        call_kwargs = mock_collection.upsert.call_args
+        metadatas = call_kwargs.kwargs.get("metadatas") or call_kwargs.args[2]
+        for meta in metadatas:
+            assert None not in meta.values(), "Metadata must not contain None values"
