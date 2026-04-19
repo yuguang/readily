@@ -153,6 +153,74 @@ class TestParseAgentResult:
         ev = parse_agent_result(data, requirement_id=9)
         assert ev.needs_human_review is True
 
+    def test_null_numeric_fields_coerced_to_defaults(self):
+        """Regression: LLM returning ``page_number: null`` / ``confidence: null``
+        must not blow up with ``int(None)`` / ``float(None)``.
+        """
+        data = {
+            "answer": "no",
+            "citation_text": "some text",
+            "source_file": "file.pdf",
+            "page_number": None,
+            "confidence": None,
+            "reasoning": "no data",
+        }
+        ev = parse_agent_result(data, requirement_id=10)
+        assert ev.answer == AnswerType.NO
+        assert ev.page_number == 0
+        assert ev.confidence == pytest.approx(0.0)
+        assert ev.needs_human_review is False  # parsed cleanly, no fallback
+
+    def test_null_string_fields_coerced_to_empty(self):
+        """Regression: LLM returning ``citation_text: null`` etc. must not
+        trigger a pydantic validation error on the required ``str`` fields.
+        """
+        data = {
+            "answer": "no",
+            "citation_text": None,
+            "source_file": None,
+            "page_number": 0,
+            "confidence": 0.0,
+            "reasoning": None,
+        }
+        ev = parse_agent_result(data, requirement_id=11)
+        assert ev.citation_text == ""
+        assert ev.source_file == ""
+        assert ev.reasoning == ""
+        assert ev.needs_human_review is False
+
+    def test_all_null_fields_via_json_string(self):
+        """Regression: full-null payload as a JSON string is parsed cleanly."""
+        payload = json.dumps(
+            {
+                "answer": "no",
+                "citation_text": None,
+                "source_file": None,
+                "page_number": None,
+                "confidence": None,
+                "reasoning": None,
+            }
+        )
+        ev = parse_agent_result(payload, requirement_id=12)
+        assert ev.answer == AnswerType.NO
+        assert ev.page_number == 0
+        assert ev.confidence == pytest.approx(0.0)
+        assert ev.citation_text == ""
+        assert ev.source_file == ""
+
+    def test_non_numeric_page_number_string_coerced(self):
+        """A page_number like 'N/A' should not raise; fall back to 0."""
+        data = dict(VALID_DICT, page_number="N/A")
+        ev = parse_agent_result(data, requirement_id=13)
+        assert ev.page_number == 0
+
+    def test_stringified_numeric_fields_coerced(self):
+        """Numeric fields returned as numeric strings should still parse."""
+        data = dict(VALID_DICT, page_number="5", confidence="0.42")
+        ev = parse_agent_result(data, requirement_id=14)
+        assert ev.page_number == 5
+        assert ev.confidence == pytest.approx(0.42)
+
 
 # ---------------------------------------------------------------------------
 # _fallback_evaluation

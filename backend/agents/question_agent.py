@@ -104,6 +104,33 @@ def create_question_agent(model: OpenAIModel) -> ToolCallingAgent:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """Coerce a value to int. Treats ``None`` and un-parseable values as the default."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    """Coerce a value to float. Treats ``None`` and un-parseable values as the default."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_str(value: Any, default: str = "") -> str:
+    """Coerce a value to str. Treats ``None`` as the default."""
+    if value is None:
+        return default
+    return str(value)
+
+
 def parse_agent_result(result: Any, requirement_id: int) -> Evaluation:
     """
     Parse the agent's ``final_answer`` output into an :class:`Evaluation`.
@@ -112,6 +139,10 @@ def parse_agent_result(result: Any, requirement_id: int) -> Evaluation:
     - A plain ``dict`` (when the agent calls ``final_answer`` with a dict).
     - A JSON string (when the agent stringifies the dict first).
     - A markdown-fenced JSON block (e.g. ```json\\n{...}\\n```).
+
+    Explicit ``null`` values for any field are treated the same as a missing
+    field (i.e. coerced to a safe default) so the LLM returning
+    ``{"page_number": null, "confidence": null}`` does not blow up the parser.
 
     Falls back to a low-confidence "no" evaluation when parsing fails.
     """
@@ -135,11 +166,11 @@ def parse_agent_result(result: Any, requirement_id: int) -> Evaluation:
         return Evaluation(
             requirement_id=requirement_id,
             answer=AnswerType(data["answer"].lower()),
-            citation_text=data.get("citation_text", ""),
-            source_file=data.get("source_file", ""),
-            page_number=int(data.get("page_number", 0)),
-            confidence=float(data.get("confidence", 0.0)),
-            reasoning=data.get("reasoning", ""),
+            citation_text=_coerce_str(data.get("citation_text")),
+            source_file=_coerce_str(data.get("source_file")),
+            page_number=_coerce_int(data.get("page_number")),
+            confidence=_coerce_float(data.get("confidence")),
+            reasoning=_coerce_str(data.get("reasoning")),
         )
     except Exception as exc:
         logger.warning(

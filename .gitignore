@@ -9,6 +9,9 @@ logs/
 # ChromaDB
 chroma_db/
 
+# cache
+.extraction_cache/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1194,6 +1194,13 @@ class TestExtractFromAllSectionsTimeout:
         try:
             with (
                 patch.object(mod, "WORKER_TIMEOUT_SECONDS", 0.2),
+                # Disable small-section batching so this test exercises the
+                # per-section agentic path (which is what run_section_extractor
+                # maps to).
+                patch.object(
+                    mod, "partition_sections_for_batching",
+                    return_value=([], list(sections)),
+                ),
                 patch.object(
                     mod, "build_hf_filter_from_pdf", return_value=None
                 ),

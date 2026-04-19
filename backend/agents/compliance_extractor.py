@@ -42,17 +42,23 @@ from sentence_transformers import SentenceTransformer
 from smolagents import OpenAIModel, Tool, ToolCallingAgent
 
 from backend.config import (
+    COMPLIANCE_EMBED_WORKERS,
+    COMPLIANCE_HTTP_TIMEOUT_SECONDS,
     COMPLIANCE_LLM_API_BASE,
     COMPLIANCE_LLM_MODEL_ID,
+    COMPLIANCE_LLM_RPM,
     DEDUP_SIMILARITY_THRESHOLD,
     EMBEDDING_MODEL,
     GEMINI_API_BASE,
     GEMINI_API_KEY,
     OPENAI_API_KEY,
     COMPLIANCE_MAX_CONCURRENT_WORKERS,
+    SECTION_BATCH_MAX_CHARS,
+    SECTION_BATCH_MAX_COUNT,
     WORKER_TIMEOUT_SECONDS,
 )
 from backend.models.schemas import ComplianceRequirement, Requirement
+from backend.tools import extraction_cache
 from backend.tools.nested_list_parser import ParseNestedListTool
 from backend.tools.cross_reference_resolver import (
     SectionIndex,
@@ -63,6 +69,11 @@ from backend.tools.document_segmenter import (
     filter_obligation_sections,
     segment_document,
 )
+from backend.tools.rate_limiter import (
+    acquire_global,
+    configure_global_bucket,
+    get_global_bucket,
+)
 from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
 from backend.tools.header_footer_stripper import (
     HeaderFooterFilter,
@@ -70,6 +81,10 @@ from backend.tools.header_footer_stripper import (
     build_header_footer_filter,
     build_hf_filter_from_pdf,
 )
+
+# Prompt-version tag baked into cache keys.  Bump whenever the per-section
+# extraction prompt or schema changes so stale cached results are evicted.
+EXTRACTION_PROMPT_VERSION = "v2"
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +414,62 @@ class ResolveCrossReferenceTool(Tool):
         return f"Section: {heading}\n\n{summary}"
 
 
+class BatchResolveCrossReferenceTool(Tool):
+    """
+    Batched variant of :class:`ResolveCrossReferenceTool`.
+
+    Accepts a list of section identifiers and returns a single formatted
+    string containing every resolved section.  Using this tool once per
+    extraction saves N−1 LLM "tool call" round-trips compared to calling
+    ``resolve_cross_reference`` individually for each reference.
+    """
+
+    name = "resolve_cross_references"
+    description = (
+        "Look up MULTIPLE cross-referenced sections at once and return their "
+        "text joined together. Prefer this tool over resolve_cross_reference "
+        "when the section contains two or more references (e.g. 'see Section "
+        "III.A and Appendix B'): pass the full list in one call."
+    )
+    inputs = {
+        "section_ids": {
+            "type": "array",
+            "description": (
+                "List of section identifiers to look up, e.g. "
+                "['III.A', 'Appendix B', '4.2']."
+            ),
+            "items": {"type": "string"},
+        }
+    }
+    output_type = "string"
+
+    def __init__(self, section_index: SectionIndex) -> None:
+        super().__init__()
+        self._index = section_index
+
+    def forward(self, section_ids: list[str]) -> str:  # type: ignore[override]
+        if not section_ids:
+            return "Error: section_ids must be a non-empty list."
+        blocks: list[str] = []
+        seen: set[str] = set()
+        for raw in section_ids:
+            if not isinstance(raw, str):
+                continue
+            sid = raw.strip()
+            if not sid or sid.lower() in seen:
+                continue
+            seen.add(sid.lower())
+            result = self._index.resolve(sid)
+            if result is None:
+                blocks.append(f"[{sid}] No section found.")
+                continue
+            heading, summary = result
+            blocks.append(f"[{sid}] Section: {heading}\n{summary}")
+        if not blocks:
+            return "No valid section identifiers provided."
+        return "\n\n---\n\n".join(blocks)
+
+
 # ---------------------------------------------------------------------------
 # Section extraction prompt
 # ---------------------------------------------------------------------------
@@ -419,11 +490,14 @@ AVAILABLE TOOLS:
                               lettered lists so you correctly attribute each
                               sub-item to its parent obligation. Returns '[]' if
                               no list structure is found (safe to call always).
-  resolve_cross_reference   — (section_id) returns the body of a referenced
-                              section. Call once per cross-reference you encounter
-                              (e.g. 'III.A', 'Appendix B', '4.2'). Use the
-                              returned text to understand conditional requirements
-                              that span multiple sections.
+  resolve_cross_references  — (section_ids) returns the bodies of MULTIPLE
+                              referenced sections in a single call. PREFER this
+                              tool when the section contains two or more
+                              cross-references (e.g. 'III.A', 'Appendix B',
+                              '4.2'). Call once with the full list instead of
+                              once per reference.
+  resolve_cross_reference   — (section_id) single-reference variant. Use only
+                              when exactly one reference is present.
 
 WORKFLOW:
   1. Call get_section_text to retrieve the raw text.
@@ -436,9 +510,12 @@ WORKFLOW:
       obligations.
   3. Scan the cleaned text for internal cross-references
      ("see Section X", "as defined in Appendix Y", "per Section 4.2", etc.).
-     For each distinct referenced section, call resolve_cross_reference(section_id=X)
-     to obtain context. Use that context only to clarify conditional logic —
-     do not extract requirements FROM the referenced section.
+     Collect ALL distinct referenced section ids into a single list and call
+     resolve_cross_references(section_ids=[X, Y, Z]) exactly once to obtain
+     their combined context.  Fall back to resolve_cross_reference(section_id=X)
+     only when exactly one reference is present. Use the returned context only
+     to clarify conditional logic — do not extract requirements FROM the
+     referenced section.
   4. Extract all compliance obligations from the CLEANED text (step 2 output).
   5. Return a JSON array via final_answer.
 
@@ -599,7 +676,16 @@ def _make_model() -> OpenAIModel:
 
     For all other models, :class:`~smolagents.OpenAIModel` is used with the
     OpenAI API (or a custom ``COMPLIANCE_LLM_API_BASE`` endpoint).
+
+    The underlying OpenAI client is configured with a
+    ``COMPLIANCE_HTTP_TIMEOUT_SECONDS`` per-request HTTP timeout so a network
+    stall surfaces as a retryable exception instead of blocking for the
+    SDK's 600s default.
     """
+    # Per-request HTTP timeout is passed through smolagents' ``client_kwargs``
+    # escape hatch and ultimately reaches the OpenAI client constructor.
+    client_kwargs: dict[str, Any] = {"timeout": COMPLIANCE_HTTP_TIMEOUT_SECONDS}
+
     if COMPLIANCE_LLM_MODEL_ID.startswith("gemini/"):
         # Strip the litellm-style "gemini/" provider prefix — OpenAIModel
         # talks directly to the Gemini OpenAI-compatible REST endpoint.
@@ -609,6 +695,7 @@ def _make_model() -> OpenAIModel:
             api_key=GEMINI_API_KEY,
             api_base=GEMINI_API_BASE,
             temperature=0.2,
+            client_kwargs=client_kwargs,
         )
 
     # Default: OpenAI (or a custom OpenAI-compatible endpoint)
@@ -616,6 +703,7 @@ def _make_model() -> OpenAIModel:
         "model_id": COMPLIANCE_LLM_MODEL_ID,
         "api_key": OPENAI_API_KEY,
         "temperature": 0.2,
+        "client_kwargs": client_kwargs,
     }
     if COMPLIANCE_LLM_API_BASE:
         kwargs["api_base"] = COMPLIANCE_LLM_API_BASE
@@ -648,17 +736,21 @@ def run_section_extractor(
     Returns an empty list (with a logged warning) if the agent fails or
     returns malformed JSON — never raises.
     """
-    get_text_tool     = GetSectionTextTool(section)
-    strip_tool        = StripHeadersFootersTool(
+    resolved_index = section_index or SectionIndex()
+    get_text_tool       = GetSectionTextTool(section)
+    strip_tool          = StripHeadersFootersTool(
         hf_filter.repeated_signatures if hf_filter else frozenset()
     )
-    resolve_tool      = ResolveCrossReferenceTool(section_index or SectionIndex())
-    parse_list_tool   = ParseNestedListTool()
+    resolve_tool        = ResolveCrossReferenceTool(resolved_index)
+    batch_resolve_tool  = BatchResolveCrossReferenceTool(resolved_index)
+    parse_list_tool     = ParseNestedListTool()
 
     agent = ToolCallingAgent(
-        tools=[get_text_tool, strip_tool, parse_list_tool, resolve_tool],
+        tools=[get_text_tool, strip_tool, parse_list_tool, batch_resolve_tool, resolve_tool],
         model=_make_model(),
-        max_steps=14,   # get_text + strip + parse_list? + up to ~6 resolves + final_answer
+        # One batched resolve call replaces up to ~6 individual lookups, so
+        # the typical upper bound drops from ~14 to ~9 steps.
+        max_steps=10,
         name="section_requirement_extractor",
         description="Extracts compliance requirements from one document section.",
         instructions=_SECTION_EXTRACTION_INSTRUCTIONS,
@@ -708,11 +800,44 @@ def run_section_extractor(
 # ---------------------------------------------------------------------------
 
 
+def _section_cache_key(section: DocumentSection) -> str:
+    """Hash used to key per-section extraction results in the artifact cache.
+
+    Combines the section heading + full body + tables + the current prompt
+    version so a prompt change invalidates stale results automatically.
+    """
+    body = section.text + "\n".join(section.tables)
+    return extraction_cache.hash_text(
+        body,
+        section.heading,
+        str(section.level),
+        EXTRACTION_PROMPT_VERSION,
+    )
+
+
+def _cached_requirements_to_models(
+    cached: list[dict[str, Any]],
+    section: DocumentSection,
+) -> list[ComplianceRequirement]:
+    """Revive cached requirement dicts back into :class:`ComplianceRequirement`."""
+    out: list[ComplianceRequirement] = []
+    for item in cached:
+        try:
+            out.append(ComplianceRequirement.model_validate(item))
+        except (ValidationError, TypeError) as exc:
+            logger.warning(
+                "Section %r: dropping malformed cached requirement: %s",
+                section.heading, exc,
+            )
+    return out
+
+
 async def _run_section_with_timeout(
     section: DocumentSection,
     section_index: SectionIndex | None = None,
     hf_filter: HeaderFooterFilter | None = None,
     timeout_seconds: float = WORKER_TIMEOUT_SECONDS,
+    pdf_hash: str | None = None,
 ) -> list[ComplianceRequirement]:
     """
     Run :func:`run_section_extractor` in a worker thread with a wall-clock timeout.
@@ -724,18 +849,40 @@ async def _run_section_with_timeout(
     forcibly kill threads blocked in C extensions / network I/O — but it no
     longer blocks ``asyncio.as_completed`` from advancing.
 
+    Before dispatching the worker we (a) check the on-disk extraction cache
+    keyed by ``(pdf_hash, section_hash, prompt_version)`` — a hit short-
+    circuits the LLM call entirely — and (b) acquire one token from the
+    global RPM bucket so concurrent workers respect provider rate limits.
+
     Args:
         section:         The section to extract from.
         section_index:   Cross-reference index for the full document.
         hf_filter:       Header/footer filter for the full document.
         timeout_seconds: Wall-clock timeout per section.  Defaults to
                          :data:`~backend.config.WORKER_TIMEOUT_SECONDS`.
+        pdf_hash:        Optional SHA-256 of the source PDF for cache keying.
+                         When ``None`` the cache is bypassed.
 
     Returns:
         Extracted requirements, or ``[]`` on timeout / thread error.
     """
+    # Cache fast path: identical (PDF, section body, prompt) ⇒ reuse results.
+    section_hash: str | None = None
+    if pdf_hash:
+        section_hash = _section_cache_key(section)
+        cached = extraction_cache.get_section_requirements(pdf_hash, section_hash)
+        if cached is not None:
+            logger.debug(
+                "Section %r: cache hit (%d requirements).",
+                section.heading, len(cached),
+            )
+            return _cached_requirements_to_models(cached, section)
+
+    # Respect the global RPM bucket before we spend an LLM call.
+    await acquire_global(1)
+
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             asyncio.to_thread(
                 run_section_extractor, section, section_index, hf_filter
             ),
@@ -749,11 +896,22 @@ async def _run_section_with_timeout(
         )
         return []
 
+    # Write-through cache for successful extractions (including empty lists,
+    # which represent a legitimate "no obligations here" outcome).
+    if pdf_hash and section_hash:
+        extraction_cache.put_section_requirements(
+            pdf_hash,
+            section_hash,
+            [r.model_dump() for r in result],
+        )
+    return result
+
 
 async def extract_from_all_sections(
     sections: list[DocumentSection],
     section_index: SectionIndex | None = None,
     hf_filter: HeaderFooterFilter | None = None,
+    pdf_hash: str | None = None,
 ) -> list[ComplianceRequirement]:
     """
     Extract compliance requirements from all sections concurrently.
@@ -767,6 +925,7 @@ async def extract_from_all_sections(
         sections:      Obligation-bearing sections from the filtering step.
         section_index: Pre-built cross-reference index for the full document.
         hf_filter:     Pre-built header/footer filter for the full document.
+        pdf_hash:      Optional SHA-256 of the source PDF for cache keying.
 
     Returns:
         Flat list of all extracted :class:`ComplianceRequirement` objects.
@@ -777,6 +936,7 @@ async def extract_from_all_sections(
         async with semaphore:
             return await _run_section_with_timeout(
                 section, section_index, hf_filter, WORKER_TIMEOUT_SECONDS,
+                pdf_hash=pdf_hash,
             )
 
     tasks = [asyncio.create_task(extract_one(s)) for s in sections]
@@ -786,6 +946,238 @@ async def extract_from_all_sections(
         all_reqs.extend(section_reqs)
 
     return all_reqs
+
+
+# ---------------------------------------------------------------------------
+# Batched small-section extraction (optimisation #3)
+# ---------------------------------------------------------------------------
+# Each call to ``run_section_extractor`` pays a full agentic round-trip
+# (3–6 tool steps + final_answer).  For very small sections that cost
+# dominates the actual extraction work.  ``_extract_small_sections_batch``
+# packs up to ``SECTION_BATCH_MAX_COUNT`` small sections into a single
+# direct LLM completion request and parses a per-section response.
+#
+# The batched path is purely additive: large sections continue to use the
+# agentic pipeline, and batched output is funneled through the same
+# ``_parse_compliance_requirements`` so validation rules are identical.
+# ---------------------------------------------------------------------------
+
+
+_BATCH_EXTRACTION_PROMPT = """\
+You are a compliance requirement extractor.  You will be given MULTIPLE short
+document sections delimited by [SECTION_START ...]/[SECTION_END] markers.
+For EACH section, extract every compliance obligation.
+
+Return ONE JSON object with this exact shape:
+
+  {
+    "sections": [
+      {
+        "heading": "<the section's exact heading>",
+        "requirements": [ <requirement objects ...> ]
+      },
+      ...
+    ]
+  }
+
+Each requirement object follows this schema:
+  {
+    "text":              "Does the P&P state that ...?",
+    "exact_quote":       "verbatim text from the section",
+    "reference":         "<section heading>, page <N>",
+    "category":          "topic label",
+    "obligation_type":   "mandatory | prohibition | conditional | recommended",
+    "obligation_level":  "mandatory | conditional_mandatory | recommended | informational",
+    "actor":             "who must act",
+    "action_required":   "what must be done",
+    "condition":         "trigger condition, or null",
+    "timeframe":         "deadline/frequency, or null",
+    "evidence_needed":   "what proves compliance, or null",
+    "risk_area":         "Privacy | Security | Financial | Operations | Clinical | Administrative"
+  }
+
+If a section has no obligations return an empty requirements array for it.
+Return ONLY the JSON object.  No prose, no markdown fences.
+"""
+
+
+def _build_batch_prompt(sections: list[DocumentSection]) -> str:
+    """Concatenate small sections into a single batch-extraction user prompt."""
+    parts: list[str] = [_BATCH_EXTRACTION_PROMPT, ""]
+    for sec in sections:
+        parts.append(
+            f"[SECTION_START heading={sec.heading!r} page={sec.page_start}]"
+        )
+        if sec.text.strip():
+            parts.append(sec.text.strip())
+        for i, table in enumerate(sec.tables, start=1):
+            parts.append(f"[TABLE {i}]\n{table}\n[/TABLE {i}]")
+        parts.append("[SECTION_END]")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def _parse_batch_response(
+    raw: str,
+    sections: list[DocumentSection],
+) -> list[ComplianceRequirement]:
+    """Parse a batched-extraction JSON response back into per-section requirements."""
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        inner = lines[1:]
+        if inner and inner[-1].strip() == "```":
+            inner = inner[:-1]
+        text = "\n".join(inner).strip()
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        text = match.group()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Batch extraction: non-JSON response (%s). Raw (200): %s",
+            exc, raw[:200],
+        )
+        return []
+
+    heading_to_section = {s.heading: s for s in sections}
+    all_reqs: list[ComplianceRequirement] = []
+    for entry in payload.get("sections") or []:
+        if not isinstance(entry, dict):
+            continue
+        heading = str(entry.get("heading") or "").strip()
+        section = heading_to_section.get(heading)
+        if section is None:
+            # Soft-match: accept closest prefix when model slightly rewrites
+            # the heading.
+            for h, s in heading_to_section.items():
+                if heading and (heading in h or h in heading):
+                    section = s
+                    break
+        if section is None:
+            logger.debug("Batch extraction: unknown heading %r; skipping.", heading)
+            continue
+        items = entry.get("requirements") or []
+        all_reqs.extend(_parse_compliance_requirements(items, section))
+    return all_reqs
+
+
+def _run_batch_extraction_sync(
+    sections: list[DocumentSection],
+) -> list[ComplianceRequirement]:
+    """Blocking worker: one LLM call → requirements for all *sections*.
+
+    Uses the ``OpenAIModel`` client directly (bypassing the ToolCallingAgent)
+    to save the ~3–6 tool-call round-trips the agent would otherwise perform.
+    Pre-strips header/footer noise so the prompt stays small.
+    """
+    if not sections:
+        return []
+    model = _make_model()
+    prompt = _build_batch_prompt(sections)
+    try:
+        # ``OpenAIModel`` exposes the underlying ``openai`` client as ``.client``.
+        response = model.client.chat.completions.create(  # type: ignore[attr-defined]
+            model=model.model_id,  # type: ignore[attr-defined]
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        raw = response.choices[0].message.content or ""
+    except Exception as exc:
+        logger.warning(
+            "Batch extraction: LLM call failed (%d sections): %s",
+            len(sections), exc,
+        )
+        return []
+    return _parse_batch_response(raw, sections)
+
+
+async def _run_batch_with_timeout(
+    sections: list[DocumentSection],
+    timeout_seconds: float = WORKER_TIMEOUT_SECONDS,
+    pdf_hash: str | None = None,
+) -> list[ComplianceRequirement]:
+    """Async wrapper: cache-aware, rate-limited batched small-section extraction."""
+    if not sections:
+        return []
+
+    # Cache lookup: combined (pdf_hash, concatenated section hashes) keys the batch.
+    batch_hash: str | None = None
+    if pdf_hash:
+        parts = [_section_cache_key(s) for s in sections]
+        batch_hash = extraction_cache.hash_text("|".join(parts), "batch", EXTRACTION_PROMPT_VERSION)
+        cached = extraction_cache.get_section_requirements(pdf_hash, batch_hash)
+        if cached is not None:
+            # Route cached dicts through per-section validation to preserve behaviour.
+            synthetic = sections[0]
+            return _cached_requirements_to_models(cached, synthetic)
+
+    await acquire_global(1)
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_run_batch_extraction_sync, sections),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Batch extraction timed out after %ss (%d sections); falling back to empty.",
+            timeout_seconds, len(sections),
+        )
+        return []
+
+    if pdf_hash and batch_hash:
+        extraction_cache.put_section_requirements(
+            pdf_hash, batch_hash, [r.model_dump() for r in result],
+        )
+    return result
+
+
+def partition_sections_for_batching(
+    sections: list[DocumentSection],
+    max_chars: int = SECTION_BATCH_MAX_CHARS,
+    max_count: int = SECTION_BATCH_MAX_COUNT,
+) -> tuple[list[list[DocumentSection]], list[DocumentSection]]:
+    """Split *sections* into (small_batches, large_sections).
+
+    - Sections whose ``char_count`` is below *max_chars* are grouped into
+      batches of up to *max_count* elements, subject to a combined-char
+      budget of ``max_chars * max_count``.
+    - Sections >= *max_chars* keep the agentic per-section path.
+    - When *max_chars* <= 0 batching is disabled and every section is routed
+      to the large-section path.
+    """
+    if max_chars <= 0 or max_count <= 1:
+        return [], list(sections)
+
+    small_batches: list[list[DocumentSection]] = []
+    large: list[DocumentSection] = []
+    current: list[DocumentSection] = []
+    current_chars = 0
+    char_budget = max_chars * max_count
+
+    for sec in sections:
+        if sec.char_count >= max_chars or sec.tables:
+            # Tables can be long and include structured data — let the
+            # agentic extractor handle them directly.
+            large.append(sec)
+            continue
+        if (
+            len(current) >= max_count
+            or current_chars + sec.char_count > char_budget
+        ):
+            if current:
+                small_batches.append(current)
+            current = [sec]
+            current_chars = sec.char_count
+        else:
+            current.append(sec)
+            current_chars += sec.char_count
+
+    if current:
+        small_batches.append(current)
+    return small_batches, large
 
 
 # ---------------------------------------------------------------------------
@@ -809,9 +1201,54 @@ def _completeness_score(req: ComplianceRequirement) -> int:
     return sum(1 for f in optional_fields if f is not None) + len(req.text or "")
 
 
+def _encode_texts(texts: list[str]) -> np.ndarray:
+    """Top-level helper used by :class:`ProcessPoolExecutor` workers.
+
+    Top-level so that the function is picklable — nested / lambda helpers
+    cannot cross the process boundary.
+    """
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    return model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+
+def _encode_with_process_pool(
+    texts: list[str],
+    max_workers: int | None,
+) -> np.ndarray:
+    """Encode *texts* using a :class:`ProcessPoolExecutor`.
+
+    Falls back to in-process encoding when the pool fails to start (e.g. in
+    restricted environments).  Splits the workload into roughly-equal shards
+    so each worker only loads the SentenceTransformer model once.
+    """
+    import concurrent.futures as _cf
+
+    n = len(texts)
+    workers = max_workers if max_workers and max_workers > 0 else min(4, max(1, n // 32 or 1))
+    if workers <= 1 or n < 16:
+        # Process-pool start-up is ~1s; only worth it for non-trivial batches.
+        return _encode_texts(texts)
+
+    # Even shards, last one absorbs the remainder.
+    shard_size = (n + workers - 1) // workers
+    shards = [texts[i : i + shard_size] for i in range(0, n, shard_size)]
+    try:
+        with _cf.ProcessPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_encode_texts, shards))
+    except (OSError, RuntimeError) as exc:
+        logger.warning(
+            "Dedup: ProcessPoolExecutor failed (%s); falling back to in-process encoding.",
+            exc,
+        )
+        return _encode_texts(texts)
+    return np.vstack(results)
+
+
 def deduplicate_requirements(
     requirements: list[ComplianceRequirement],
     similarity_threshold: float = DEDUP_SIMILARITY_THRESHOLD,
+    *,
+    parallel_workers: int | None = None,
 ) -> list[ComplianceRequirement]:
     """
     Merge near-duplicate requirements using embedding cosine similarity.
@@ -824,6 +1261,10 @@ def deduplicate_requirements(
     Args:
         requirements: Raw requirements from the extraction step.
         similarity_threshold: Cosine similarity cutoff (default 0.90).
+        parallel_workers: If > 1, encode embeddings using a process pool of
+                          this size.  ``None`` defaults to
+                          :data:`~backend.config.COMPLIANCE_EMBED_WORKERS`.
+                          Set to 1 to force in-process encoding.
 
     Returns:
         Deduplicated list of :class:`ComplianceRequirement` objects.
@@ -831,9 +1272,12 @@ def deduplicate_requirements(
     if len(requirements) <= 1:
         return requirements
 
-    model = SentenceTransformer(EMBEDDING_MODEL)
     texts = [r.text for r in requirements]
-    embeddings = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    resolved_workers = parallel_workers if parallel_workers is not None else COMPLIANCE_EMBED_WORKERS
+    if resolved_workers and resolved_workers > 1:
+        embeddings = _encode_with_process_pool(texts, resolved_workers)
+    else:
+        embeddings = _encode_texts(texts)
     # Since embeddings are L2-normalised, dot product == cosine similarity
     sim_matrix: np.ndarray = np.dot(embeddings, embeddings.T)
 
@@ -1089,13 +1533,41 @@ async def run_compliance_extractor_with_progress(
         return {"type": "progress", "step": step, "step_number": step_number,
                 "total_steps": _steps, "detail": detail, **extra}
 
+    # Configure the global RPM bucket up-front so every worker spawned below
+    # respects the provider's rate limit.  configure_global_bucket is a no-op
+    # when COMPLIANCE_LLM_RPM == 0.
+    if COMPLIANCE_LLM_RPM > 0 and get_global_bucket() is None:
+        configure_global_bucket(COMPLIANCE_LLM_RPM)
+
+    # Compute a stable hash of the PDF bytes — used as the cache key for
+    # structured text, header/footer signatures, segmented sections, and
+    # per-section extraction results.  Falls back to ``None`` (cache
+    # bypassed) if the file cannot be hashed.
+    pdf_hash: str | None = None
+    try:
+        pdf_hash = extraction_cache.hash_pdf_bytes(pdf_path)
+    except OSError as exc:
+        logger.warning("Cache key unavailable for %s: %s", pdf_path, exc)
+
     # Step 1: Build header/footer filter then parse with structure
     # The filter is built in a separate pass so it can be shared with all
     # per-section extraction workers without re-opening the PDF.
     yield _prog("parsing", 1, "Parsing PDF structure...")
     logger.info("Compliance extractor: parsing %s with structure preservation.", pdf_path)
-    hf_filter = build_hf_filter_from_pdf(pdf_path)
-    structured_text = parse_pdf_with_structure(pdf_path, hf_filter=hf_filter)
+
+    cached_text = extraction_cache.get_structured_text(pdf_hash) if pdf_hash else None
+    cached_sigs = extraction_cache.get_hf_signatures(pdf_hash) if pdf_hash else None
+    if cached_text is not None and cached_sigs is not None:
+        structured_text = cached_text
+        hf_filter = HeaderFooterFilter(repeated_signatures=cached_sigs)
+        logger.info("Compliance extractor: cache hit for parsed PDF (%s).", pdf_hash)
+    else:
+        hf_filter = build_hf_filter_from_pdf(pdf_path)
+        structured_text = parse_pdf_with_structure(pdf_path, hf_filter=hf_filter)
+        if pdf_hash:
+            extraction_cache.put_structured_text(pdf_hash, structured_text)
+            extraction_cache.put_hf_signatures(pdf_hash, hf_filter.repeated_signatures)
+
     if not structured_text.strip():
         logger.warning("Compliance extractor: no text extracted from %s.", pdf_path)
         yield {"type": "complete", "requirements": [], "total_requirements": 0, "term_count": 0}
@@ -1103,30 +1575,54 @@ async def run_compliance_extractor_with_progress(
 
     # Step 2: Segment
     yield _prog("segmenting", 2, "Segmenting document...")
-    sections = segment_document(structured_text)
+    cached_sections = extraction_cache.get_sections(pdf_hash) if pdf_hash else None
+    if cached_sections is not None:
+        sections = cached_sections
+        logger.info("Compliance extractor: cache hit for %d sections.", len(sections))
+    else:
+        sections = segment_document(structured_text)
+        if pdf_hash:
+            extraction_cache.put_sections(pdf_hash, sections)
     yield _prog("segmenting", 2, f"Found {len(sections)} sections")
     logger.info("Compliance extractor: %d sections found.", len(sections))
 
-    # Step 3: Extract term definitions (rule-based; persist to document_terms collection)
-    yield _prog("term_extraction", 3, "Extracting term definitions and acronyms...")
-    terms = extract_term_definitions(structured_text, sections, source_file=pdf_path)
-    upsert_term_definitions(terms)
+    # Steps 3 + 4 + cross-reference index build all depend only on *sections*
+    # and are independent of one another.  Run them concurrently so the
+    # user-visible wall-clock for these preparatory steps equals the slowest
+    # rather than the sum.
     yield _prog(
         "term_extraction", 3,
-        f"Indexed {len(terms)} term definitions",
+        "Running term extraction, section filtering, and cross-reference indexing...",
     )
-    logger.info("Compliance extractor: indexed %d term definitions from %s.", len(terms), pdf_path)
 
-    # Step 4: Filter
-    yield _prog("filtering", 4, "Filtering for obligation language...")
-    obligation_sections, skipped = filter_obligation_sections(sections)
+    terms_task = asyncio.create_task(asyncio.to_thread(
+        extract_term_definitions, structured_text, sections, pdf_path,
+    ))
+    filter_task = asyncio.create_task(asyncio.to_thread(
+        filter_obligation_sections, sections,
+    ))
+    index_task = asyncio.create_task(asyncio.to_thread(
+        build_section_index, sections,
+    ))
+
+    terms, (filter_result), section_index = await asyncio.gather(
+        terms_task, filter_task, index_task,
+    )
+    obligation_sections, skipped = filter_result
+
+    # Upsert terms once the term extraction completes.  Runs in a thread so it
+    # doesn't block the event loop on Chroma I/O.
+    await asyncio.to_thread(upsert_term_definitions, terms)
+
+    yield _prog("term_extraction", 3, f"Indexed {len(terms)} term definitions")
     yield _prog(
         "filtering", 4,
         f"{len(obligation_sections)} of {len(sections)} sections contain obligation language",
     )
     logger.info(
-        "Compliance extractor: kept %d/%d sections (skipped %d).",
-        len(obligation_sections), len(sections), len(skipped),
+        "Compliance extractor: %d terms, %d/%d obligation sections, "
+        "cross-ref index with %d key variants.",
+        len(terms), len(obligation_sections), len(sections), len(section_index),
     )
 
     if not obligation_sections:
@@ -1134,36 +1630,56 @@ async def run_compliance_extractor_with_progress(
         yield {"type": "complete", "requirements": [], "total_requirements": 0, "term_count": len(terms)}
         return
 
-    # Build cross-reference index from all segments for context injection
-    section_index = build_section_index(sections)
-    logger.info(
-        "Compliance extractor: cross-reference index built (%d key variants).",
-        len(section_index),
-    )
-
-    # Step 5: Parallel per-section extraction with sub-progress
+    # Step 5: parallel extraction.  Small obligation sections are packed
+    # into batches that share a single LLM request; large sections keep the
+    # agentic per-section path.  Both paths run concurrently, bounded by the
+    # same semaphore so total in-flight LLM calls stays <=
+    # COMPLIANCE_MAX_CONCURRENT_WORKERS.
+    small_batches, large_sections = partition_sections_for_batching(obligation_sections)
+    total_units = len(small_batches) + len(large_sections)
     yield _prog(
         "extracting", 5, "Extracting requirements from sections...",
         sections_completed=0, sections_total=len(obligation_sections),
     )
+    logger.info(
+        "Compliance extractor: extraction plan — %d batched-small units, "
+        "%d large sections (%d total units).",
+        len(small_batches), len(large_sections), total_units,
+    )
+
     raw_requirements: list[ComplianceRequirement] = []
-    completed = 0
+    completed_sections = 0
     semaphore = asyncio.Semaphore(COMPLIANCE_MAX_CONCURRENT_WORKERS)
 
-    async def _extract_one(section: DocumentSection) -> list[ComplianceRequirement]:
+    async def _extract_one(section: DocumentSection) -> tuple[int, list[ComplianceRequirement]]:
         async with semaphore:
-            return await _run_section_with_timeout(
+            reqs = await _run_section_with_timeout(
                 section, section_index, hf_filter, WORKER_TIMEOUT_SECONDS,
+                pdf_hash=pdf_hash,
             )
+        return 1, reqs
 
-    tasks = [asyncio.create_task(_extract_one(s)) for s in obligation_sections]
+    async def _extract_batch(batch: list[DocumentSection]) -> tuple[int, list[ComplianceRequirement]]:
+        async with semaphore:
+            reqs = await _run_batch_with_timeout(
+                batch, WORKER_TIMEOUT_SECONDS, pdf_hash=pdf_hash,
+            )
+        return len(batch), reqs
+
+    tasks: list[asyncio.Task] = []
+    for sec in large_sections:
+        tasks.append(asyncio.create_task(_extract_one(sec)))
+    for batch in small_batches:
+        tasks.append(asyncio.create_task(_extract_batch(batch)))
+
     for coro in asyncio.as_completed(tasks):
-        section_reqs = await coro
+        units_done, section_reqs = await coro
         raw_requirements.extend(section_reqs)
-        completed += 1
+        completed_sections += units_done
         yield _prog(
             "extracting", 5, "Extracting requirements from sections...",
-            sections_completed=completed, sections_total=len(obligation_sections),
+            sections_completed=completed_sections,
+            sections_total=len(obligation_sections),
         )
 
     logger.info("Compliance extractor: extracted %d raw requirements.", len(raw_requirements))

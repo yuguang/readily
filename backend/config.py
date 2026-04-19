@@ -7,6 +7,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 POLICIES_DIR = DATA_DIR / "Public Policies"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 UPLOADS_DIR = PROJECT_ROOT / "uploads"
+EXTRACTION_CACHE_DIR = PROJECT_ROOT / ".extraction_cache"
 
 UPLOADS_DIR.mkdir(exist_ok=True)
 
@@ -31,9 +32,23 @@ LONG_DOC_PAGE_THRESHOLD = int(os.getenv("LONG_DOC_PAGE_THRESHOLD", "20"))
 
 # Parallelization
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "8"))
-COMPLIANCE_MAX_CONCURRENT_WORKERS = int(os.getenv("COMPLIANCE_MAX_CONCURRENT_WORKERS", "20"))
+# Bumped from 20 → 40: coupled with the new global RPM token bucket,
+# per-section workers only block on the bucket when near the provider's
+# rate limit rather than on a hand-tuned semaphore.
+COMPLIANCE_MAX_CONCURRENT_WORKERS = int(os.getenv("COMPLIANCE_MAX_CONCURRENT_WORKERS", "40"))
 WORKER_TIMEOUT_SECONDS = int(os.getenv("WORKER_TIMEOUT_SECONDS", "300"))
 INGEST_MAX_WORKERS = int(os.getenv("INGEST_MAX_WORKERS", "4"))
+
+# Per-request HTTP timeout for the compliance LLM client.  Set low enough
+# that a network stall fails fast into the tenacity retry loop rather than
+# waiting for the OpenAI SDK's 600s default.
+COMPLIANCE_HTTP_TIMEOUT_SECONDS = float(os.getenv("COMPLIANCE_HTTP_TIMEOUT_SECONDS", "60"))
+
+# Global rate limits for the compliance LLM.  Tune to match your provider tier.
+# A value of 0 disables the bucket (backwards-compatible).
+COMPLIANCE_LLM_RPM = int(os.getenv("COMPLIANCE_LLM_RPM", "600"))
+# Process-pool size for embedding / dedup CPU work.  None → os.cpu_count().
+COMPLIANCE_EMBED_WORKERS = int(os.getenv("COMPLIANCE_EMBED_WORKERS", "0")) or None
 
 # Embedding
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
@@ -53,6 +68,16 @@ COLLECTION_NAME = "policy_documents"
 # Compliance extraction (Component 8)
 SECTION_MAX_CHARS = 5000          # Max chars per section before sub-splitting
 DEDUP_SIMILARITY_THRESHOLD = 0.90
+# Sections below this char count are batched into a single LLM request
+# instead of paying a full agent round-trip each.  Set to 0 to disable
+# batching entirely (pre-#3 behaviour).
+SECTION_BATCH_MAX_CHARS = int(os.getenv("SECTION_BATCH_MAX_CHARS", "800"))
+# Maximum number of small sections packed into a single batched extraction
+# call.  Keeps prompt size bounded.
+SECTION_BATCH_MAX_COUNT = int(os.getenv("SECTION_BATCH_MAX_COUNT", "8"))
+# Enable on-disk caching of structured_text, header/footer signatures, and
+# segmented sections keyed by PDF SHA-256.  Set to "0" to disable.
+EXTRACTION_CACHE_ENABLED = os.getenv("EXTRACTION_CACHE_ENABLED", "1") != "0"
 
 # Term definition extraction
 TERM_COLLECTION_NAME = "document_terms"
