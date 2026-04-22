@@ -6,17 +6,17 @@ interface Props {
 }
 
 function DocTypeBadge({ docType, count }: { docType: string; count: number }) {
-  const isStructured = docType === 'structured';
+  const isNarrative = docType === 'narrative';
   return (
     <span
       className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium ${
-        isStructured
-          ? 'bg-blue-100 text-blue-700'
-          : 'bg-purple-100 text-purple-700'
+        isNarrative
+          ? 'bg-purple-100 text-purple-700'
+          : 'bg-blue-100 text-blue-700'
       }`}
     >
-      {isStructured ? '📋' : '📄'}
-      {isStructured ? `Structured (${count} questions)` : `Narrative (${count} requirements)`}
+      {isNarrative ? '📄' : '📋'}
+      {isNarrative ? `Narrative (${count} obligations)` : `Compliance (${count} requirements)`}
     </span>
   );
 }

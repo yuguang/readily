@@ -161,10 +161,13 @@ function ResultRow({ req, evaluation, onExpand, onApprove }: ResultRowProps) {
 
 // ── Phase banner ──────────────────────────────────────────────────────────────
 
-function PhaseBanner({ phase }: { phase: string }) {
+function PhaseBanner({ phase, docType }: { phase: string; docType: string }) {
   if (phase === 'idle' || phase === 'complete') return null;
+  const isNarrative = docType === 'narrative';
   const messages: Record<string, string> = {
-    reviewing: 'AI agents are reviewing requirements in parallel…',
+    reviewing: isNarrative
+      ? 'AI agents are reviewing extracted obligations in parallel…'
+      : 'AI agents are reviewing requirements in parallel…',
     critic: 'Critic pass in progress — reviewing flagged evaluations…',
   };
   return (
@@ -178,7 +181,7 @@ function PhaseBanner({ phase }: { phase: string }) {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function ReviewTable({ uploadResponse }: Props) {
-  const { session_id, requirements } = uploadResponse;
+  const { session_id, requirements, doc_type } = uploadResponse;
   const {
     evaluations,
     progress,
@@ -302,7 +305,7 @@ export function ReviewTable({ uploadResponse }: Props) {
         )}
 
         {/* Phase banner */}
-        <PhaseBanner phase={phase} />
+        <PhaseBanner phase={phase} docType={doc_type} />
 
         {/* Error */}
         {error && (

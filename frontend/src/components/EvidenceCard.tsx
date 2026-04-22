@@ -134,14 +134,16 @@ export function EvidenceCard({ requirement, evaluation, onClose, onUpdate }: Pro
           </div>
 
           {/* Source */}
-          <div>
-            <p className="text-xs text-gray-400 uppercase tracking-wide mb-1">Source</p>
-            <p className="text-sm text-gray-700">
-              <span className="font-medium">{evaluation.source_file}</span>
-              {', Page '}
-              {evaluation.page_number}
-            </p>
-          </div>
+          {evaluation.source_file && evaluation.page_number > 0 && (
+            <div>
+              <p className="text-xs text-gray-400 uppercase tracking-wide mb-1">Source</p>
+              <p className="text-sm text-gray-700">
+                <span className="font-medium">{evaluation.source_file}</span>
+                {', Page '}
+                {evaluation.page_number}
+              </p>
+            </div>
+          )}
 
           {/* Reasoning */}
           <div>
