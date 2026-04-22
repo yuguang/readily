@@ -28,17 +28,14 @@ flowchart LR
 
 ### 1. Requirement Extraction Router
 
-Three-way routing based on document type and length. Runs once per uploaded PDF.
+Two-way routing based on document length. Runs once per uploaded PDF.
 
 ```mermaid
 flowchart TD
     PDF["Uploaded PDF"] --> Parse["Parse PDF\n(PyMuPDF)"]
-    Parse --> Regex{"Regex finds ≥5\nnumbered questions?"}
-    Regex -->|Yes| Structured["✅ Structured Extraction\n(deterministic regex)\nNo LLM needed"]
-    Regex -->|No| Length{"Page count\n> 20?"}
+    Parse --> Length{"Page count\n> 20?"}
     Length -->|"≤ 20 pages"| Narrative["📝 Narrative Agent\nSingle-pass ToolCallingAgent\nReads full text → extracts requirements"]
     Length -->|"> 20 pages"| Compliance["📚 Compliance Extraction Pipeline\n"]
-    Structured --> Reqs["list of Requirement"]
     Narrative --> Reqs
     Compliance -->|"Enriched schema\n+ progress streaming"| Reqs
 ```

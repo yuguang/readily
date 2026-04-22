@@ -64,7 +64,7 @@ def _session(
     return ReviewSession(
         id=session_id,
         filename="test.pdf",
-        doc_type="structured",
+        doc_type="narrative",
         requirements=requirements if requirements is not None else [_req(1), _req(2)],
         evaluations=evaluations if evaluations is not None else [],
         created_at=datetime.now(timezone.utc),
@@ -137,11 +137,9 @@ def seeded(client):
 
 class TestUpload:
     def test_valid_pdf_returns_200(self, client):
-        # Route 1 requires ≥ 3 structured questions
-        reqs = [_req(1), _req(2), _req(3)]
         with (
             patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]),
-            patch("backend.main.parse_review_form", return_value=reqs),
+            patch("backend.main.run_narrative_extractor", return_value=[_req(1), _req(2), _req(3)]),
         ):
             resp = client.post(
                 "/upload",
@@ -150,7 +148,7 @@ class TestUpload:
         assert resp.status_code == 200
         body = resp.json()
         assert body["filename"] == "report.pdf"
-        assert body["doc_type"] == "structured"
+        assert body["doc_type"] == "narrative"
         assert body["extraction_status"] == "complete"
         assert len(body["requirements"]) == 3
         assert "session_id" in body
@@ -178,10 +176,9 @@ class TestUpload:
         from backend.main import sessions  # noqa: PLC0415
 
         reqs = [_req(1)]
-        # Simulate short narrative (1 page, 0 structured questions)
+        # Simulate short narrative (1 page)
         with (
             patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "narrative"}]),
-            patch("backend.main.parse_review_form", return_value=[]),
             patch("backend.main.run_narrative_extractor", return_value=reqs),
         ):
             resp = client.post(
@@ -198,7 +195,6 @@ class TestUpload:
 
         with (
             patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]),
-            patch("backend.main.parse_review_form", return_value=[]),
             patch("backend.main.run_narrative_extractor", return_value=[]),
         ):
             resp = client.post(
@@ -208,12 +204,29 @@ class TestUpload:
         sid = resp.json()["session_id"]
         uuid.UUID(sid)  # raises if not a valid UUID
 
+    def test_narrative_upload_indexes_terms(self, client):
+        with (
+            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "narrative"}]),
+            patch("backend.main.run_narrative_extractor", return_value=[]),
+            patch("backend.main.parse_pdf_with_structure", return_value="[PAGE 1]\ntext"),
+            patch("backend.main.segment_document", return_value=[]),
+            patch("backend.main.extract_term_definitions", return_value=[]) as mock_extract_terms,
+            patch("backend.main.upsert_term_definitions") as mock_upsert_terms,
+        ):
+            resp = client.post(
+                "/upload",
+                files={"file": ("guide.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
+            )
+
+        assert resp.status_code == 200
+        mock_extract_terms.assert_called_once()
+        mock_upsert_terms.assert_called_once_with([])
+
     def test_long_doc_returns_processing_status(self, client):
-        """A PDF with >20 pages and no structured questions returns extraction_status='processing'."""
+        """A PDF with >20 pages returns extraction_status='processing'."""
         many_pages = [{"page_number": i, "text": f"page {i}"} for i in range(1, 22)]  # 21 pages
         with (
             patch("backend.main.parse_pdf", return_value=many_pages),
-            patch("backend.main.parse_review_form", return_value=[]),
         ):
             resp = client.post(
                 "/upload",
@@ -268,7 +281,7 @@ class TestGetResults:
         body = resp.json()
         assert body["id"] == _SESSION_ID
         assert body["filename"] == "test.pdf"
-        assert body["doc_type"] == "structured"
+        assert body["doc_type"] == "narrative"
 
     def test_unknown_session_returns_404(self, client):
         resp = client.get("/review/no-such-session/results")

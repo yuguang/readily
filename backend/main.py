@@ -20,7 +20,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
-from backend.agents.compliance_extractor import run_compliance_extractor_with_progress
+from backend.agents.compliance_extractor import (
+    parse_pdf_with_structure,
+    run_compliance_extractor_with_progress,
+)
 from backend.agents.dispatcher import stream_review
 from backend.config import LONG_DOC_PAGE_THRESHOLD, UPLOADS_DIR
 from backend.models.schemas import (
@@ -34,7 +37,8 @@ from backend.models.schemas import (
 from backend.tools.narrative_extractor import run_narrative_extractor
 from backend.tools.pdf_parser import parse_pdf
 from backend.tools.policy_search import get_chroma_collection
-from backend.tools.review_form_parser import parse_review_form
+from backend.tools.document_segmenter import segment_document
+from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +82,6 @@ sessions: dict[str, ReviewSession] = {}
 # Maps session_id → uploaded PDF path (kept for the extraction-stream endpoint)
 _session_pdf_paths: dict[str, str] = {}
 
-# Minimum structured questions to classify as structured form (mirrors extractor.py)
-_STRUCTURED_THRESHOLD = 3
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,16 +117,12 @@ def _get_evaluation(session: ReviewSession, requirement_id: int) -> Evaluation:
 async def upload_pdf(file: UploadFile) -> UploadResponse:
     """Upload a regulatory PDF and extract compliance requirements.
 
-    Saves the file to ``uploads/{session_id}.pdf``, then routes on document
-    type and length:
+    Saves the file to ``uploads/{session_id}.pdf``, then routes by length:
 
-    - **Structured** (regex-detectable numbered questions): requirements
-      extracted synchronously; response includes full list with
-      ``extraction_status="complete"``.
     - **Short narrative** (≤20 pages): single-pass LLM extraction runs
       synchronously; response includes full list with
       ``extraction_status="complete"``.
-    - **Long compliance doc** (>20 pages, no structured questions): returns
+    - **Long compliance doc** (>20 pages): returns
       immediately with ``extraction_status="processing"`` and an empty
       requirements list.  The frontend connects to
       ``GET /upload/{session_id}/extraction-stream`` for real-time progress.
@@ -147,18 +145,27 @@ async def upload_pdf(file: UploadFile) -> UploadResponse:
         else:
             full_text = "\n".join(p["text"] for p in pages)
 
-            # Route 1: structured form (regex, no LLM)
-            reqs = parse_review_form(full_text)
-            if len(reqs) >= _STRUCTURED_THRESHOLD:
-                doc_type, requirements, extraction_status = "structured", reqs, "complete"
-
-            # Route 2: long compliance doc — return immediately
-            elif len(pages) > LONG_DOC_PAGE_THRESHOLD:
+            # Route 1: long compliance doc — return immediately
+            if len(pages) > LONG_DOC_PAGE_THRESHOLD:
                 doc_type, requirements, extraction_status = "compliance", [], "processing"
-
-            # Route 3: short narrative — single-pass LLM (synchronous)
+            # Route 2: short narrative — single-pass LLM (synchronous)
             else:
                 requirements = run_narrative_extractor(full_text)
+                try:
+                    structured_text = parse_pdf_with_structure(str(pdf_path))
+                    sections = segment_document(structured_text)
+                    terms = extract_term_definitions(
+                        structured_text,
+                        sections,
+                        str(pdf_path),
+                    )
+                    upsert_term_definitions(terms)
+                except Exception as exc:
+                    logger.warning(
+                        "Narrative term extraction failed for %s: %s",
+                        pdf_path,
+                        exc,
+                    )
                 doc_type, extraction_status = "narrative", "complete"
 
     except Exception as exc:

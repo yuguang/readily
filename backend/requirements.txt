@@ -10,7 +10,8 @@ google-generativeai>=0.8.0
 
 # Vector store & embeddings
 chromadb==1.5.7
-sentence-transformers==3.3.1
+sentence-transformers>=4.1.0
+accelerate>=0.33.0
 
 # PDF processing
 pymupdf==1.25.3

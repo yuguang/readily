@@ -3,7 +3,7 @@ Tests for Component 3: Requirement Extraction.
 
 Covers:
 - parse_review_form: exact count, spot-check questions 1/18/40/64, text clean-up
-- classify_and_extract router: correct doc_type for structured and narrative PDFs
+- classify_and_extract router: correct doc_type for narrative and compliance PDFs
 - GetDocumentTextTool: returns text, validates smolagents interface
 - _parse_requirements: JSON, markdown-fenced, list, and error cases
 - Edge cases: empty text, no matching questions, whitespace-only text
@@ -380,13 +380,20 @@ class TestClassifyAndExtractRouter:
     """
 
     @pytest.mark.anyio
-    async def test_routes_easy_pdf_to_structured(self):
-        """Easy PDF (14 pages, 64 numbered questions) → structured."""
+    async def test_routes_easy_pdf_to_narrative(self):
+        """Easy PDF (14 pages) → short narrative route."""
         from backend.agents.extractor import classify_and_extract
+        mock_reqs = [Requirement(id=1, text="Does the P&P state X?")]
+        with patch(
+            "backend.agents.extractor.run_narrative_extractor",
+            return_value=mock_reqs,
+        ) as mock_narrative:
+            doc_type, reqs = await classify_and_extract(str(EASY_PDF))
 
-        doc_type, reqs = await classify_and_extract(str(EASY_PDF))
-        assert doc_type == "structured"
-        assert len(reqs) == 64
+        assert doc_type == "narrative"
+        assert reqs == mock_reqs
+        mock_narrative.assert_called_once()
+        assert len(reqs) == 1
 
     @pytest.mark.anyio
     async def test_routes_hard_pdf_to_compliance(self):
@@ -429,8 +436,8 @@ class TestClassifyAndExtractRouter:
         mock_compliance.assert_not_called()
 
     @pytest.mark.anyio
-    async def test_structured_threshold_is_3(self):
-        """Two matching questions (< threshold) routes to narrative, not compliance."""
+    async def test_numbered_questions_still_route_by_length(self):
+        """Regex-like numbered questions no longer create a structured route."""
         from backend.agents.extractor import classify_and_extract
 
         two_questions = (
@@ -449,7 +456,7 @@ class TestClassifyAndExtractRouter:
                 return_value=[],
             ) as mock_narrative,
         ):
-            # 1 page → below threshold → Route 3 (short narrative)
+            # 1 page → Route 2 (short narrative)
             mock_parse.return_value = [{"page_number": 1, "text": two_questions}]
             doc_type, _ = await classify_and_extract("fake.pdf")
 
@@ -457,32 +464,8 @@ class TestClassifyAndExtractRouter:
         mock_narrative.assert_called_once()
 
     @pytest.mark.anyio
-    async def test_structured_threshold_met_skips_llm(self):
-        """Three or more structured questions → Route 1, no LLM call."""
-        from backend.agents.extractor import classify_and_extract
-
-        three_questions = "".join(
-            f"{i}. Does the P&P state requirement {i}?\n"
-            f"(Reference: APL 99-001, page {i})\n Yes  No\n"
-            for i in range(1, 4)
-        )
-
-        with (
-            patch("backend.agents.extractor.parse_pdf") as mock_parse,
-            patch("backend.agents.extractor.run_narrative_extractor") as mock_narrative,
-            patch("backend.agents.extractor.run_compliance_extractor") as mock_compliance,
-        ):
-            mock_parse.return_value = [{"page_number": 1, "text": three_questions}]
-            doc_type, reqs = await classify_and_extract("fake.pdf")
-
-        assert doc_type == "structured"
-        assert len(reqs) == 3
-        mock_narrative.assert_not_called()
-        mock_compliance.assert_not_called()
-
-    @pytest.mark.anyio
     async def test_long_doc_routes_to_compliance(self):
-        """Doc with no structured questions and >20 pages → Route 2 (compliance)."""
+        """Doc with >20 pages routes to compliance extraction."""
         from backend.agents.extractor import classify_and_extract
         from backend.models.schemas import ComplianceRequirement
 
@@ -510,7 +493,7 @@ class TestClassifyAndExtractRouter:
 
     @pytest.mark.anyio
     async def test_boundary_20_pages_routes_to_narrative(self):
-        """A doc with exactly 20 pages (= threshold) → Route 3 (short narrative)."""
+        """A doc with exactly 20 pages (= threshold) → Route 2 (short narrative)."""
         from backend.agents.extractor import classify_and_extract
 
         with (
