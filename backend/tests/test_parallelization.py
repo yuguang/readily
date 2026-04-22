@@ -12,6 +12,7 @@ Tests for the compliance extraction parallelization changes (#1-5 + #8):
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -375,21 +376,23 @@ class TestBatchExtraction:
     def test_batch_timeout_returns_empty(self):
         """A hung batched LLM call must not stall the pipeline."""
         sections = [_make_section("A"), _make_section("B")]
+        release = threading.Event()
 
         def blocking(*args, **kwargs):
-            time.sleep(10.0)
+            # Block until the async coroutine has already returned (released
+            # by run_and_release below), so asyncio.run() teardown is fast.
+            release.wait(timeout=5.0)
             return []
 
-        with patch.object(mod, "_run_batch_extraction_sync", side_effect=blocking):
-            start = time.monotonic()
-            result = asyncio.run(
-                _run_batch_with_timeout(sections, timeout_seconds=0.1, pdf_hash=None)
+        async def run_and_release():
+            result = await _run_batch_with_timeout(
+                sections, timeout_seconds=0.1, pdf_hash=None
             )
-            # We don't measure asyncio.run teardown; coroutine itself should
-            # hit the timeout path promptly but the sync blocker runs in
-            # another thread the loop waits on during shutdown.  So relax
-            # the assertion: just make sure the return value is correct.
-            _ = time.monotonic() - start
+            release.set()  # unblock the thread so asyncio.run() can drain quickly
+            return result
+
+        with patch.object(mod, "_run_batch_extraction_sync", side_effect=blocking):
+            result = asyncio.run(run_and_release())
         assert result == []
 
 
@@ -399,6 +402,26 @@ class TestBatchExtraction:
 
 
 class TestDedupParallelWorkers:
+    @pytest.fixture(autouse=True)
+    def _fast_embeddings(self, monkeypatch):
+        """Stub _encode_texts so tests don't load a SentenceTransformer model.
+
+        Returns deterministic unit vectors: same text → same vector (cosine
+        sim 1.0), different texts → orthogonal vectors (cosine sim 0.0).
+        """
+        def _fake_encode(texts: list[str]) -> np.ndarray:
+            unique = list(dict.fromkeys(texts))
+            n = len(unique)
+            dim = max(n, 16)
+            basis = np.eye(dim)
+            text_to_vec = {t: basis[i] for i, t in enumerate(unique)}
+            return np.array([text_to_vec[t] for t in texts])
+
+        monkeypatch.setattr(
+            "backend.agents.compliance_extractor._encode_texts",
+            _fake_encode,
+        )
+
     def test_parallel_workers_falls_back_when_pool_fails(self):
         """If the ProcessPoolExecutor errors out, dedup must still succeed."""
         reqs = [_make_req(f"Does X {i}?") for i in range(20)]

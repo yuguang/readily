@@ -21,6 +21,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from backend.agents.compliance_extractor import (
@@ -269,6 +270,27 @@ class TestFilterObligationSections:
 
 
 class TestDeduplicateRequirements:
+    @pytest.fixture(autouse=True)
+    def _fast_embeddings(self, monkeypatch):
+        """Stub SentenceTransformer encoding so tests don't load a model from disk.
+
+        Returns deterministic unit vectors: identical texts get the same vector
+        (cosine sim = 1.0); distinct texts get orthogonal vectors (cosine sim = 0.0).
+        This preserves all clustering/merging logic while keeping tests fast.
+        """
+        def _fake_encode(texts: list[str]) -> np.ndarray:
+            unique = list(dict.fromkeys(texts))
+            n = len(unique)
+            dim = max(n, 16)
+            basis = np.eye(dim)
+            text_to_vec = {t: basis[i] for i, t in enumerate(unique)}
+            return np.array([text_to_vec[t] for t in texts])
+
+        monkeypatch.setattr(
+            "backend.agents.compliance_extractor._encode_texts",
+            _fake_encode,
+        )
+
     def test_empty_list_returned_unchanged(self):
         assert deduplicate_requirements([]) == []
 
@@ -902,6 +924,19 @@ class TestExtractTermDefinitions:
 
 
 class TestUpsertTermDefinitions:
+    @pytest.fixture(autouse=True)
+    def _no_embedding_model(self, monkeypatch):
+        """Stub SentenceTransformerEmbeddingFunction to avoid loading the model.
+
+        The constructor is called inside upsert_term_definitions even when
+        get_or_create_collection is mocked, because Python evaluates arguments
+        before the call.  Replacing it with a no-op prevents the ~5s model load.
+        """
+        monkeypatch.setattr(
+            "backend.tools.term_extractor.SentenceTransformerEmbeddingFunction",
+            lambda **kwargs: MagicMock(),
+        )
+
     def _make_term(
         self,
         term: str = "Enhanced Care Management",
