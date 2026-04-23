@@ -7,7 +7,7 @@ import type { Requirement, UploadResponse } from '../types';
 const USE_MOCK = import.meta.env.VITE_MOCK === 'true';
 
 // Pipeline step descriptors — match the SSE `step` field values from the backend.
-const PIPELINE_STEPS: { key: string; label: string }[] = [
+const COMPLIANCE_STEPS: { key: string; label: string }[] = [
   { key: 'parsing', label: 'Parse' },
   { key: 'segmenting', label: 'Segment' },
   { key: 'filtering', label: 'Filter' },
@@ -17,16 +17,26 @@ const PIPELINE_STEPS: { key: string; label: string }[] = [
   { key: 'finalizing', label: 'Done' },
 ];
 
+const NARRATIVE_STEPS: { key: string; label: string }[] = [
+  { key: 'reading', label: 'Read' },
+  { key: 'extracting', label: 'Extract' },
+  { key: 'parsing', label: 'Parse' },
+  { key: 'segmenting', label: 'Segment' },
+  { key: 'defining', label: 'Define' },
+  { key: 'saving', label: 'Save' },
+];
+
 // ── Extraction progress panel ─────────────────────────────────────────────────
 
 interface ExtractionProgressProps {
   filename: string;
   sessionId: string;
+  docType: string;
   onComplete: (requirements: Requirement[]) => void;
   onError: (message: string) => void;
 }
 
-function ExtractionProgress({ filename, sessionId, onComplete, onError }: ExtractionProgressProps) {
+function ExtractionProgress({ filename, sessionId, docType, onComplete, onError }: ExtractionProgressProps) {
   const { currentStep, requirements, error } = useExtractionProgress(sessionId);
 
   useEffect(() => {
@@ -37,8 +47,9 @@ function ExtractionProgress({ filename, sessionId, onComplete, onError }: Extrac
     if (error) onError(error);
   }, [error, onError]);
 
+  const steps = docType === 'narrative' ? NARRATIVE_STEPS : COMPLIANCE_STEPS;
   const stepNum = currentStep?.step_number ?? 0;
-  const totalSteps = currentStep?.total_steps ?? PIPELINE_STEPS.length;
+  const totalSteps = currentStep?.total_steps ?? steps.length;
   const activeKey = currentStep?.step ?? '';
 
   return (
@@ -77,7 +88,7 @@ function ExtractionProgress({ filename, sessionId, onComplete, onError }: Extrac
 
       {/* Pipeline step indicators */}
       <div className="flex items-end justify-center gap-2">
-        {PIPELINE_STEPS.map((s, i) => {
+        {steps.map((s, i) => {
           const stepIndex = i + 1;
           const isDone = stepIndex < stepNum;
           const isActive = s.key === activeKey;
@@ -203,12 +214,17 @@ export function UploadForm({ onUploaded }: Props) {
         <div className="w-full max-w-xl">
           <div className="mb-8 text-center">
             <h1 className="text-3xl font-bold text-gray-900">Readily</h1>
-            <p className="mt-2 text-gray-500">Processing compliance document…</p>
+            <p className="mt-2 text-gray-500">
+              {extractingSession.docType === 'narrative'
+                ? 'Extracting requirements…'
+                : 'Processing compliance document…'}
+            </p>
           </div>
           <div className="bg-white rounded-xl border-2 border-blue-200 shadow-sm p-8">
             <ExtractionProgress
               filename={extractingSession.filename}
               sessionId={extractingSession.sessionId}
+              docType={extractingSession.docType}
               onComplete={handleExtractionComplete}
               onError={handleExtractionError}
             />

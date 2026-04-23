@@ -8,10 +8,11 @@ compliance requirements as a JSON array.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, AsyncGenerator
 
 from pydantic import ValidationError
 from smolagents import OpenAIModel, Tool, ToolCallingAgent
@@ -197,3 +198,89 @@ def run_narrative_extractor(full_text: str) -> list[Requirement]:
     )
 
     return _parse_requirements(result)
+
+
+_NARRATIVE_TOTAL_STEPS = 6
+
+
+async def run_narrative_extractor_with_progress(
+    full_text: str, pdf_path: str
+) -> AsyncGenerator[dict, None]:
+    """Async generator that runs narrative extraction and yields SSE-compatible
+    progress dicts, then a final completion dict.
+
+    Yields dicts with ``type="progress"`` during processing and
+    ``type="complete"`` when finished, matching the shape produced by
+    :func:`~backend.agents.compliance_extractor.run_compliance_extractor_with_progress`.
+    """
+    loop = asyncio.get_running_loop()
+
+    yield {
+        "type": "progress",
+        "step": "reading",
+        "step_number": 1,
+        "total_steps": _NARRATIVE_TOTAL_STEPS,
+        "detail": "Reading document",
+    }
+    await asyncio.sleep(0)
+
+    yield {
+        "type": "progress",
+        "step": "extracting",
+        "step_number": 2,
+        "total_steps": _NARRATIVE_TOTAL_STEPS,
+        "detail": "Extracting requirements",
+    }
+
+    requirements = await loop.run_in_executor(None, run_narrative_extractor, full_text)
+
+    try:
+        from backend.agents.compliance_extractor import parse_pdf_with_structure
+        from backend.tools.document_segmenter import segment_document
+        from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
+
+        yield {
+            "type": "progress",
+            "step": "parsing",
+            "step_number": 3,
+            "total_steps": _NARRATIVE_TOTAL_STEPS,
+            "detail": "Parsing document structure",
+        }
+        structured_text = await loop.run_in_executor(None, parse_pdf_with_structure, pdf_path)
+
+        yield {
+            "type": "progress",
+            "step": "segmenting",
+            "step_number": 4,
+            "total_steps": _NARRATIVE_TOTAL_STEPS,
+            "detail": "Segmenting sections",
+        }
+        sections = await loop.run_in_executor(None, segment_document, structured_text)
+
+        yield {
+            "type": "progress",
+            "step": "defining",
+            "step_number": 5,
+            "total_steps": _NARRATIVE_TOTAL_STEPS,
+            "detail": "Extracting term definitions",
+        }
+        terms = await loop.run_in_executor(
+            None, extract_term_definitions, structured_text, sections, pdf_path
+        )
+
+        yield {
+            "type": "progress",
+            "step": "saving",
+            "step_number": 6,
+            "total_steps": _NARRATIVE_TOTAL_STEPS,
+            "detail": "Saving terms",
+        }
+        await loop.run_in_executor(None, upsert_term_definitions, terms)
+    except Exception as exc:
+        logger.warning("Narrative term extraction failed for %s: %s", pdf_path, exc)
+
+    yield {
+        "type": "complete",
+        "requirements": [r.model_dump() for r in requirements],
+        "total_requirements": len(requirements),
+    }

@@ -20,10 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
-from backend.agents.compliance_extractor import (
-    parse_pdf_with_structure,
-    run_compliance_extractor_with_progress,
-)
+from backend.agents.compliance_extractor import run_compliance_extractor_with_progress
 from backend.agents.dispatcher import stream_review
 from backend.config import LONG_DOC_PAGE_THRESHOLD, UPLOADS_DIR
 from backend.models.schemas import (
@@ -34,11 +31,11 @@ from backend.models.schemas import (
     UpdateEvaluationRequest,
     UploadResponse,
 )
-from backend.tools.narrative_extractor import run_narrative_extractor
+from backend.tools.narrative_extractor import (
+    run_narrative_extractor_with_progress,
+)
 from backend.tools.pdf_parser import parse_pdf
 from backend.tools.policy_search import get_chroma_collection
-from backend.tools.document_segmenter import segment_document
-from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +78,9 @@ sessions: dict[str, ReviewSession] = {}
 
 # Maps session_id → uploaded PDF path (kept for the extraction-stream endpoint)
 _session_pdf_paths: dict[str, str] = {}
+
+# Maps session_id → full document text (narrative docs only, freed after extraction)
+_session_full_texts: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -148,25 +148,10 @@ async def upload_pdf(file: UploadFile) -> UploadResponse:
             # Route 1: long compliance doc — return immediately
             if len(pages) > LONG_DOC_PAGE_THRESHOLD:
                 doc_type, requirements, extraction_status = "compliance", [], "processing"
-            # Route 2: short narrative — single-pass LLM (synchronous)
+            # Route 2: short narrative — async LLM extraction via SSE stream
             else:
-                requirements = run_narrative_extractor(full_text)
-                try:
-                    structured_text = parse_pdf_with_structure(str(pdf_path))
-                    sections = segment_document(structured_text)
-                    terms = extract_term_definitions(
-                        structured_text,
-                        sections,
-                        str(pdf_path),
-                    )
-                    upsert_term_definitions(terms)
-                except Exception as exc:
-                    logger.warning(
-                        "Narrative term extraction failed for %s: %s",
-                        pdf_path,
-                        exc,
-                    )
-                doc_type, extraction_status = "narrative", "complete"
+                _session_full_texts[session_id] = full_text
+                doc_type, requirements, extraction_status = "narrative", [], "processing"
 
     except Exception as exc:
         pdf_path.unlink(missing_ok=True)
@@ -218,14 +203,19 @@ async def stream_extraction_progress(session_id: str) -> EventSourceResponse:
 
     async def event_generator():
         try:
-            async for progress in run_compliance_extractor_with_progress(pdf_path):
+            if session.doc_type == "narrative":
+                full_text = _session_full_texts.pop(session_id, "")
+                extractor = run_narrative_extractor_with_progress(full_text, pdf_path)
+            else:
+                extractor = run_compliance_extractor_with_progress(pdf_path)
+
+            async for progress in extractor:
                 if progress["type"] == "progress":
                     yield {
                         "event": "extraction_progress",
                         "data": json.dumps(progress),
                     }
                 elif progress["type"] == "complete":
-                    # Populate session requirements from the completed extraction
                     session.requirements = [
                         Requirement(**r) for r in progress["requirements"]
                     ]
