@@ -60,11 +60,12 @@ def _session(
     requirements: list[Requirement] | None = None,
     evaluations: list[Evaluation] | None = None,
     status: str = "reviewing",
+    doc_type: str = "narrative",
 ) -> ReviewSession:
     return ReviewSession(
         id=session_id,
         filename="test.pdf",
-        doc_type="narrative",
+        doc_type=doc_type,
         requirements=requirements if requirements is not None else [_req(1), _req(2)],
         evaluations=evaluations if evaluations is not None else [],
         created_at=datetime.now(timezone.utc),
@@ -100,13 +101,15 @@ def _reset_sse_app_status():
 @pytest.fixture(autouse=True)
 def _clear_sessions():
     """Ensure the in-memory session store is empty before and after each test."""
-    from backend.main import sessions, _session_pdf_paths  # noqa: PLC0415
+    from backend.main import sessions, _session_pdf_paths, _session_full_texts  # noqa: PLC0415
 
     sessions.clear()
     _session_pdf_paths.clear()
+    _session_full_texts.clear()
     yield
     sessions.clear()
     _session_pdf_paths.clear()
+    _session_full_texts.clear()
 
 
 @pytest.fixture()
@@ -137,10 +140,7 @@ def seeded(client):
 
 class TestUpload:
     def test_valid_pdf_returns_200(self, client):
-        with (
-            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]),
-            patch("backend.main.run_narrative_extractor", return_value=[_req(1), _req(2), _req(3)]),
-        ):
+        with patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]):
             resp = client.post(
                 "/upload",
                 files={"file": ("report.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
@@ -149,8 +149,8 @@ class TestUpload:
         body = resp.json()
         assert body["filename"] == "report.pdf"
         assert body["doc_type"] == "narrative"
-        assert body["extraction_status"] == "complete"
-        assert len(body["requirements"]) == 3
+        assert body["extraction_status"] == "processing"
+        assert body["requirements"] == []
         assert "session_id" in body
 
     def test_non_pdf_returns_400(self, client):
@@ -175,12 +175,8 @@ class TestUpload:
     def test_upload_creates_session_in_store(self, client):
         from backend.main import sessions  # noqa: PLC0415
 
-        reqs = [_req(1)]
-        # Simulate short narrative (1 page)
-        with (
-            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "narrative"}]),
-            patch("backend.main.run_narrative_extractor", return_value=reqs),
-        ):
+        # Short narrative (1 page) returns processing — session is created immediately
+        with patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "narrative"}]):
             resp = client.post(
                 "/upload",
                 files={"file": ("guide.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
@@ -193,10 +189,7 @@ class TestUpload:
     def test_upload_response_session_id_is_uuid(self, client):
         import uuid  # noqa: PLC0415
 
-        with (
-            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]),
-            patch("backend.main.run_narrative_extractor", return_value=[]),
-        ):
+        with patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "..."}]):
             resp = client.post(
                 "/upload",
                 files={"file": ("x.pdf", io.BytesIO(b"%PDF"), "application/pdf")},
@@ -205,22 +198,31 @@ class TestUpload:
         uuid.UUID(sid)  # raises if not a valid UUID
 
     def test_narrative_upload_indexes_terms(self, client):
-        with (
-            patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "narrative"}]),
-            patch("backend.main.run_narrative_extractor", return_value=[]),
-            patch("backend.main.parse_pdf_with_structure", return_value="[PAGE 1]\ntext"),
-            patch("backend.main.segment_document", return_value=[]),
-            patch("backend.main.extract_term_definitions", return_value=[]) as mock_extract_terms,
-            patch("backend.main.upsert_term_definitions") as mock_upsert_terms,
-        ):
+        """Term indexing happens during the SSE extraction stream, not upload."""
+        # Upload sets up a processing session
+        with patch("backend.main.parse_pdf", return_value=[{"page_number": 1, "text": "narrative"}]):
             resp = client.post(
                 "/upload",
                 files={"file": ("guide.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
             )
-
         assert resp.status_code == 200
-        mock_extract_terms.assert_called_once()
-        mock_upsert_terms.assert_called_once_with([])
+        sid = resp.json()["session_id"]
+
+        async def mock_narrative_extractor(full_text, pdf_path):
+            yield {"type": "complete", "requirements": [], "total_requirements": 0}
+
+        # Term extraction runs inside run_narrative_extractor_with_progress.
+        # Verify the SSE stream dispatches to the narrative extractor for short docs
+        # by checking the session transitions to "reviewing" after the stream completes.
+        from backend.main import sessions  # noqa: PLC0415
+
+        with patch(
+            "backend.main.run_narrative_extractor_with_progress",
+            mock_narrative_extractor,
+        ):
+            client.get(f"/upload/{sid}/extraction-stream")
+
+        assert sessions[sid].status == "reviewing"
 
     def test_long_doc_returns_processing_status(self, client):
         """A PDF with >20 pages returns extraction_status='processing'."""
@@ -607,7 +609,7 @@ class TestExtractionStream:
         """Insert a session in 'extracting' status and return it."""
         from backend.main import sessions, _session_pdf_paths  # noqa: PLC0415
 
-        sess = _session(status="extracting", requirements=[])
+        sess = _session(status="extracting", requirements=[], doc_type="compliance")
         sessions[_SESSION_ID] = sess
         _session_pdf_paths[_SESSION_ID] = "/fake/path.pdf"
         return sess

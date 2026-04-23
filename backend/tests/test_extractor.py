@@ -4,7 +4,6 @@ Tests for Component 3: Requirement Extraction.
 Covers:
 - parse_review_form: exact count, spot-check questions 1/18/40/64, text clean-up
 - classify_and_extract router: correct doc_type for narrative and compliance PDFs
-- GetDocumentTextTool: returns text, validates smolagents interface
 - _parse_requirements: JSON, markdown-fenced, list, and error cases
 - Edge cases: empty text, no matching questions, whitespace-only text
 """
@@ -19,7 +18,7 @@ import fitz  # PyMuPDF — used to build synthetic PDFs in tests
 import pytest
 
 from backend.models.schemas import Requirement
-from backend.tools.narrative_extractor import GetDocumentTextTool, _parse_requirements
+from backend.tools.narrative_extractor import _parse_requirements
 from backend.tools.review_form_parser import (
     _clean_question_text,
     is_structured_form,
@@ -267,34 +266,6 @@ class TestIsStructuredForm:
 
     def test_no_numbered_questions(self):
         assert is_structured_form("This is a narrative policy document.") is False
-
-
-# ===========================================================================
-# GetDocumentTextTool
-# ===========================================================================
-
-
-class TestGetDocumentTextTool:
-    def test_returns_stored_text(self):
-        tool = GetDocumentTextTool("hello regulatory world")
-        assert tool() == "hello regulatory world"
-
-    def test_empty_text(self):
-        tool = GetDocumentTextTool("")
-        assert tool() == ""
-
-    def test_name_and_description_set(self):
-        tool = GetDocumentTextTool("text")
-        assert tool.name == "get_document_text"
-        assert tool.description  # non-empty
-
-    def test_inputs_is_empty_dict(self):
-        tool = GetDocumentTextTool("x")
-        assert tool.inputs == {}
-
-    def test_output_type_is_string(self):
-        tool = GetDocumentTextTool("x")
-        assert tool.output_type == "string"
 
 
 # ===========================================================================

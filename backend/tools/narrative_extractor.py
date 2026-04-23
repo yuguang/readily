@@ -1,9 +1,8 @@
 """
-LLM-based extractor for narrative regulatory documents.
+LLM-based extractor for short narrative regulatory documents (≤20 pages).
 
-Used as the fallback when a document is not a structured DHCS review form.
-A smolagents ToolCallingAgent reads the full document text and extracts
-compliance requirements as a JSON array.
+Makes a single chat completion call to Gemini with the full document text
+and parses the JSON array response into Requirement objects.
 """
 
 from __future__ import annotations
@@ -14,8 +13,8 @@ import logging
 import re
 from typing import Any, AsyncGenerator
 
+import openai
 from pydantic import ValidationError
-from smolagents import OpenAIModel, Tool, ToolCallingAgent
 
 from backend.config import GEMINI_API_BASE, GEMINI_API_KEY, LLM_MODEL_ID
 from backend.models.schemas import Requirement
@@ -24,58 +23,28 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Document text tool
+# Prompt
 # ---------------------------------------------------------------------------
 
+_SYSTEM_PROMPT = """\
+You are a healthcare compliance analyst. Extract every compliance requirement
+from the regulatory document provided by the user.
 
-class GetDocumentTextTool(Tool):
-    """
-    A no-input smolagents tool that returns the full text of the document
-    currently being processed.  Instantiated per extraction call so the
-    closure over ``text`` is safe.
-    """
+A requirement is any statement that a Managed Care Plan (MCP) MUST, SHALL,
+or is REQUIRED to do. Also include SHOULD and EXPECTED TO statements.
 
-    name = "get_document_text"
-    description = (
-        "Returns the full plain text of the regulatory document to analyse. "
-        "Call this first to read the document before extracting requirements."
-    )
-    inputs: dict = {}
-    output_type = "string"
+For each requirement produce a JSON object with these fields:
+- "id": sequential integer starting at 1
+- "text": the requirement phrased as a yes/no question starting with
+  "Does the P&P state that..."
+- "reference": section/page reference in the document
+  (e.g. "Section III, page 10" or "Chapter 5")
+- "category": short topic label
+  (e.g. "Eligibility", "Payment", "Provider Network", "Reporting")
 
-    def __init__(self, text: str) -> None:
-        super().__init__()
-        self._text = text
+Return ONLY a JSON array of requirement objects — no markdown fences, no preamble.
 
-    def forward(self) -> str:  # type: ignore[override]
-        return self._text
-
-
-# ---------------------------------------------------------------------------
-# Agent instructions
-# ---------------------------------------------------------------------------
-
-_EXTRACTION_INSTRUCTIONS = """\
-You are a healthcare compliance analyst. Your task is to extract every
-compliance requirement from a regulatory document.
-
-Steps:
-1. Call get_document_text to retrieve the full document.
-2. Read the document carefully and identify EVERY distinct compliance
-   requirement — statements that a Managed Care Plan (MCP) MUST, SHALL,
-   or is REQUIRED to do.  Also include SHOULD and EXPECTED TO statements.
-3. For each requirement, produce a JSON object with these fields:
-   - "id": sequential integer starting at 1
-   - "text": the requirement phrased as a yes/no question starting with
-     "Does the P&P state that..."
-   - "reference": section/page reference in the document
-     (e.g. "Section III, page 10" or "Chapter 5")
-   - "category": short topic label
-     (e.g. "Eligibility", "Payment", "Provider Network", "Reporting")
-4. Call final_answer with a JSON array of all requirement objects.
-   Return ONLY the JSON array — no markdown fences, no preamble.
-
-Example output:
+Example:
 [
   {
     "id": 1,
@@ -83,8 +52,7 @@ Example output:
     "reference": "Section IV, page 12",
     "category": "Enrollment"
   }
-]
-"""
+]"""
 
 
 # ---------------------------------------------------------------------------
@@ -94,14 +62,14 @@ Example output:
 
 def _parse_requirements(raw: Any) -> list[Requirement]:
     """
-    Convert the agent's ``final_answer`` into a list of :class:`Requirement`.
+    Parse a JSON string (or list) from the LLM into Requirement objects.
 
-    Handles three formats that smolagents may return:
-    - A Python list of dicts (agent called ``final_answer`` with a list).
-    - A JSON string (plain or markdown-fenced).
-    - Partial / malformed JSON — logs a warning and returns what can be parsed.
+    Handles:
+    - A plain JSON array string
+    - A markdown-fenced JSON block (```json ... ```)
+    - A JSON array embedded in surrounding prose
+    - Malformed items are skipped with a warning
     """
-    # Already a list — agent returned structured data directly
     if isinstance(raw, list):
         requirements = []
         for item in raw:
@@ -138,7 +106,7 @@ def _parse_requirements(raw: Any) -> list[Requirement]:
 
     if not isinstance(data, list):
         raise ValueError(
-            f"Expected a JSON array from the agent, got {type(data).__name__!r}: "
+            f"Expected a JSON array from the LLM, got {type(data).__name__!r}: "
             f"{str(data)[:200]}"
         )
 
@@ -159,11 +127,11 @@ def _parse_requirements(raw: Any) -> list[Requirement]:
 
 def run_narrative_extractor(full_text: str) -> list[Requirement]:
     """
-    Extract compliance requirements from a narrative regulatory document.
+    Extract compliance requirements from a short narrative regulatory document.
 
-    Creates a fresh :class:`smolagents.ToolCallingAgent` backed by Gemini that
-    reads the full document text via :class:`GetDocumentTextTool` and returns
-    structured :class:`~backend.models.schemas.Requirement` objects.
+    Sends the full document text in a single chat completion request to Gemini
+    and parses the JSON array response into :class:`~backend.models.schemas.Requirement`
+    objects.
 
     Args:
         full_text: Plain text of the entire document (all pages joined).
@@ -172,32 +140,22 @@ def run_narrative_extractor(full_text: str) -> list[Requirement]:
         List of extracted :class:`~backend.models.schemas.Requirement` objects.
 
     Raises:
-        ValueError: If the agent output cannot be parsed into requirements.
+        ValueError: If the LLM response cannot be parsed into requirements.
+        openai.OpenAIError: On API or network errors.
     """
-    parse_pdf_tool = GetDocumentTextTool(full_text)
+    client = openai.OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_API_BASE)
 
-    model = OpenAIModel(
-        model_id=LLM_MODEL_ID,
-        api_key=GEMINI_API_KEY,
-        api_base=GEMINI_API_BASE,
+    response = client.chat.completions.create(
+        model=LLM_MODEL_ID,
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": full_text},
+        ],
         temperature=0.2,
     )
 
-    agent = ToolCallingAgent(
-        tools=[parse_pdf_tool],
-        model=model,
-        name="narrative_extractor",
-        description="Extracts compliance requirements from narrative regulatory text.",
-        instructions=_EXTRACTION_INSTRUCTIONS,
-        verbosity_level=0,
-    )
-
-    result = agent.run(
-        "Call get_document_text to read the regulatory document, then extract "
-        "all compliance requirements and return them as a JSON array via final_answer."
-    )
-
-    return _parse_requirements(result)
+    raw = response.choices[0].message.content or ""
+    return _parse_requirements(raw)
 
 
 _NARRATIVE_TOTAL_STEPS = 5
@@ -217,7 +175,6 @@ async def run_narrative_extractor_with_progress(
 
     from backend.agents.compliance_extractor import parse_pdf_with_structure
     from backend.tools.document_segmenter import segment_document
-    from backend.tools.review_form_parser import parse_review_form
     from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
 
     yield {
@@ -237,7 +194,7 @@ async def run_narrative_extractor_with_progress(
         "detail": "Extracting requirements",
     }
 
-    requirements = await loop.run_in_executor(None, parse_review_form, full_text)
+    requirements = await loop.run_in_executor(None, run_narrative_extractor, full_text)
 
     try:
         yield {
