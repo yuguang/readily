@@ -233,12 +233,79 @@ Opens at `http://localhost:5173`. Upload a review form PDF (e.g. `data/Example I
 ## Testing
 
 ```sh
-# Backend tests
+# Backend unit tests (no API key required, ~5s)
 pytest backend/tests/
 
 # Frontend typecheck
 cd frontend && npm run typecheck
 ```
+
+## Evaluation Suite
+
+`backend/evals/` contains a quality evaluation suite for the requirement extraction workflow. Unlike unit tests, evals make real LLM calls and measure output quality against defined thresholds (recall, format adherence, field completeness).
+
+**Prerequisites:** `GEMINI_API_KEY` must be set.
+
+```sh
+# Run all evals
+pytest -m eval backend/evals/ -v -s
+
+# Run a specific eval class
+pytest -m eval backend/evals/eval_extraction.py::TestNarrativeExtractorQuality -v -s
+pytest -m eval backend/evals/eval_extraction.py::TestNarrativeExtractorRecall -v -s
+pytest -m eval backend/evals/eval_extraction.py::TestComplianceExtractorFieldRichness -v -s
+
+# Run the offline parser robustness tests (no API key needed)
+pytest backend/evals/eval_extraction.py::TestParseRequirementsRobustness -v
+
+# Exclude evals from a normal test run
+pytest -m "not eval"
+```
+
+### What each eval class checks
+
+| Class | API calls | Measures |
+|---|---|---|
+| `TestNarrativeExtractorQuality` | 1 | Format adherence ≥90%, reference/category completeness ≥75%, count within 50–150% of ground truth, unique IDs |
+| `TestNarrativeExtractorRecall` | 1 | Semantic recall ≥60% of 64 known requirements (embedding cosine similarity), hallucination rate ≤10% |
+| `TestParseRequirementsRobustness` | 0 | Output parser handles all LLM response variants: plain JSON, markdown fences, prose wrapping, malformed items, extra fields |
+| `TestRouterEndToEnd` | 2 | Easy PDF → `"narrative"`, Hard PDF → `"compliance"` with no mocks |
+| `TestComplianceExtractorFieldRichness` | 1 | Enriched `ComplianceRequirement` fields populated: `obligation_type` ≥40%, `actor` ≥40%, `evidence_needed` ≥30%; vocabulary and parent ID integrity |
+| `TestNarrativeExtractorStability` | 2 | Two independent runs produce counts within 20% of each other |
+
+Each test prints a metric table to stdout (use `-s` to see it). The `TestRouterEndToEnd` and `TestNarrativeExtractorStability` classes are the slowest — run targeted classes when iterating on a specific component.
+
+### Question agent evals (`backend/evals/eval_question_agent.py`)
+
+Tests the ToolCallingAgent that answers individual compliance requirements via RAG.
+
+**Additional prerequisite:** ChromaDB must be populated (`python -m backend.ingestion.ingest`).
+
+```sh
+# Full eval suite (~15–30 LLM calls):
+pytest -m eval backend/evals/eval_question_agent.py -v -s
+
+# Individual classes:
+pytest -m eval backend/evals/eval_question_agent.py::TestSearchPoliciesTool -v -s
+pytest -m eval backend/evals/eval_question_agent.py::TestDefineTermTool -v -s
+pytest -m eval backend/evals/eval_question_agent.py::TestEvaluateCitationTool -v -s
+pytest -m eval backend/evals/eval_question_agent.py::TestQuestionAgentOutputQuality -v -s
+pytest -m eval backend/evals/eval_question_agent.py::TestCitationGrounding -v -s
+
+# Offline-only (no API key, no ChromaDB needed):
+pytest backend/evals/eval_question_agent.py::TestParseAgentResultEdgeCases -v
+```
+
+| Class | API calls | ChromaDB | Measures |
+|---|---|---|---|
+| `TestParseAgentResultEdgeCases` | 0 | no | Parser handles all realistic LLM output variants: null coercion, case normalisation, fenced blocks, missing fields, fallback behaviour |
+| `TestSearchPoliciesTool` | 0 | yes | Result format (Score/Source/Text lines), top_k limits, positive similarity score on targeted queries |
+| `TestDefineTermTool` | 0 | yes | Exact abbreviation match (upper/lower), full-term match, embedding fallback, "No definition found" for unknown terms |
+| `TestEvaluateCitationTool` | 7 | no | Returns valid JSON with answer/confidence/reasoning; correct yes/no for clear-match and off-topic passages; confidence in [0,1] |
+| `TestQuestionAgentOutputQuality` | 5 | yes | All 5 requirements return valid Evaluations; fallback rate ≤20%; avg confidence ≥0.40; yes answers have citations, source files, and page numbers |
+| `TestCitationGrounding` | 5 | yes | Each "yes" citation has cosine similarity ≥0.50 to a corpus passage (anti-fabrication); citations ≤800 chars; no citations sourced from the term collection |
+| `TestAcronymAwareness` | 2 | yes | ECM/POF requirement resolves correctly; reasoning mentions "care management" or "ECM" |
+| `TestAgentStability` | 4 | yes | Same requirement gives same answer on two independent runs; confidence delta ≤0.30 |
 
 ## Project Structure
 
