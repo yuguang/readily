@@ -250,11 +250,6 @@ cd frontend && npm run typecheck
 # Run all evals
 pytest -m eval backend/evals/ -v -s
 
-# Run a specific eval class
-pytest -m eval backend/evals/eval_extraction.py::TestNarrativeExtractorQuality -v -s
-pytest -m eval backend/evals/eval_extraction.py::TestNarrativeExtractorRecall -v -s
-pytest -m eval backend/evals/eval_extraction.py::TestComplianceExtractorFieldRichness -v -s
-
 # Run the offline parser robustness tests (no API key needed)
 pytest backend/evals/eval_extraction.py::TestParseRequirementsRobustness -v
 
@@ -285,25 +280,18 @@ Tests the ToolCallingAgent that answers individual compliance requirements via R
 # Full eval suite (~15–30 LLM calls):
 pytest -m eval backend/evals/eval_question_agent.py -v -s
 
-# Individual classes:
-pytest -m eval backend/evals/eval_question_agent.py::TestSearchPoliciesTool -v -s
-pytest -m eval backend/evals/eval_question_agent.py::TestDefineTermTool -v -s
-pytest -m eval backend/evals/eval_question_agent.py::TestEvaluateCitationTool -v -s
-pytest -m eval backend/evals/eval_question_agent.py::TestQuestionAgentOutputQuality -v -s
-pytest -m eval backend/evals/eval_question_agent.py::TestCitationGrounding -v -s
-
 # Offline-only (no API key, no ChromaDB needed):
 pytest backend/evals/eval_question_agent.py::TestParseAgentResultEdgeCases -v
 ```
 
 | Class | API calls | ChromaDB | Measures |
 |---|---|---|---|
-| `TestParseAgentResultEdgeCases` | 0 | no | Parser handles all realistic LLM output variants: null coercion, case normalisation, fenced blocks, missing fields, fallback behaviour |
-| `TestSearchPoliciesTool` | 0 | yes | Result format (Score/Source/Text lines), top_k limits, positive similarity score on targeted queries |
-| `TestDefineTermTool` | 0 | yes | Exact abbreviation match (upper/lower), full-term match, embedding fallback, "No definition found" for unknown terms |
 | `TestEvaluateCitationTool` | 7 | no | Returns valid JSON with answer/confidence/reasoning; correct yes/no for clear-match and off-topic passages; confidence in [0,1] |
 | `TestQuestionAgentOutputQuality` | 5 | yes | All 5 requirements return valid Evaluations; fallback rate ≤20%; avg confidence ≥0.40; yes answers have citations, source files, and page numbers |
 | `TestCitationGrounding` | 5 | yes | Each "yes" citation has cosine similarity ≥0.50 to a corpus passage (anti-fabrication); citations ≤800 chars; no citations sourced from the term collection |
+| `TestParseAgentResultEdgeCases` | 0 | no | Parser handles all realistic LLM output variants: null coercion, case normalisation, fenced blocks, missing fields, fallback behaviour |
+| `TestSearchPoliciesTool` | 0 | yes | Result format (Score/Source/Text lines), top_k limits, positive similarity score on targeted queries |
+| `TestDefineTermTool` | 0 | yes | Exact abbreviation match (upper/lower), full-term match, embedding fallback, "No definition found" for unknown terms |
 | `TestAcronymAwareness` | 2 | yes | ECM/POF requirement resolves correctly; reasoning mentions "care management" or "ECM" |
 | `TestAgentStability` | 4 | yes | Same requirement gives same answer on two independent runs; confidence delta ≤0.30 |
 
