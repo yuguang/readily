@@ -41,7 +41,7 @@ def is_structured_form(text: str) -> bool:
 # Group 3: APL reference string
 _QUESTION_PATTERN = re.compile(
     r"(\d+)\.\s+(Does the P&P\b.+?)"
-    r"\(Reference:\s*(APL\s+[\d-]+,\s*pages?\s*[\d–\-]+(?:\s*-\s*[\d]+)?)\)",
+    r"\(Reference:\s*(APL\s+[\d-]+,\s*(?:[^()]*|\([^)]*\))*)\)",
     re.DOTALL | re.IGNORECASE,
 )
 

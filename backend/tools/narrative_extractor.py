@@ -200,7 +200,7 @@ def run_narrative_extractor(full_text: str) -> list[Requirement]:
     return _parse_requirements(result)
 
 
-_NARRATIVE_TOTAL_STEPS = 6
+_NARRATIVE_TOTAL_STEPS = 5
 
 
 async def run_narrative_extractor_with_progress(
@@ -215,14 +215,19 @@ async def run_narrative_extractor_with_progress(
     """
     loop = asyncio.get_running_loop()
 
+    from backend.agents.compliance_extractor import parse_pdf_with_structure
+    from backend.tools.document_segmenter import segment_document
+    from backend.tools.review_form_parser import parse_review_form
+    from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
+
     yield {
         "type": "progress",
-        "step": "reading",
+        "step": "parsing",
         "step_number": 1,
         "total_steps": _NARRATIVE_TOTAL_STEPS,
-        "detail": "Reading document",
+        "detail": "Parsing document structure",
     }
-    await asyncio.sleep(0)
+    structured_text = await loop.run_in_executor(None, parse_pdf_with_structure, pdf_path)
 
     yield {
         "type": "progress",
@@ -232,26 +237,13 @@ async def run_narrative_extractor_with_progress(
         "detail": "Extracting requirements",
     }
 
-    requirements = await loop.run_in_executor(None, run_narrative_extractor, full_text)
+    requirements = await loop.run_in_executor(None, parse_review_form, full_text)
 
     try:
-        from backend.agents.compliance_extractor import parse_pdf_with_structure
-        from backend.tools.document_segmenter import segment_document
-        from backend.tools.term_extractor import extract_term_definitions, upsert_term_definitions
-
-        yield {
-            "type": "progress",
-            "step": "parsing",
-            "step_number": 3,
-            "total_steps": _NARRATIVE_TOTAL_STEPS,
-            "detail": "Parsing document structure",
-        }
-        structured_text = await loop.run_in_executor(None, parse_pdf_with_structure, pdf_path)
-
         yield {
             "type": "progress",
             "step": "segmenting",
-            "step_number": 4,
+            "step_number": 3,
             "total_steps": _NARRATIVE_TOTAL_STEPS,
             "detail": "Segmenting sections",
         }
@@ -260,7 +252,7 @@ async def run_narrative_extractor_with_progress(
         yield {
             "type": "progress",
             "step": "defining",
-            "step_number": 5,
+            "step_number": 4,
             "total_steps": _NARRATIVE_TOTAL_STEPS,
             "detail": "Extracting term definitions",
         }
@@ -271,7 +263,7 @@ async def run_narrative_extractor_with_progress(
         yield {
             "type": "progress",
             "step": "saving",
-            "step_number": 6,
+            "step_number": 5,
             "total_steps": _NARRATIVE_TOTAL_STEPS,
             "detail": "Saving terms",
         }

@@ -18,9 +18,8 @@ const COMPLIANCE_STEPS: { key: string; label: string }[] = [
 ];
 
 const NARRATIVE_STEPS: { key: string; label: string }[] = [
-  { key: 'reading', label: 'Read' },
-  { key: 'extracting', label: 'Extract' },
   { key: 'parsing', label: 'Parse' },
+  { key: 'extracting', label: 'Extract' },
   { key: 'segmenting', label: 'Segment' },
   { key: 'defining', label: 'Define' },
   { key: 'saving', label: 'Save' },

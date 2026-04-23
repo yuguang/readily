@@ -9,10 +9,8 @@ Automates healthcare P&P policy audits against regulatory checklists. AI agents 
 ```mermaid
 flowchart LR
     Upload["📄 Upload PDF"] --> Router
-    Router --> Structured["Regex Extraction"]
     Router --> Short["Narrative Agent"]
     Router --> Long["Compliance Extraction\nPipeline"]
-    Structured --> Confirm["✅ Confirm\nRequirements"]
     Short --> Confirm
     Long -->|SSE progress| Confirm
     Confirm --> Dispatcher["Parallel Dispatcher\n(8 workers)"]
@@ -34,7 +32,7 @@ Two-way routing based on document length. Runs once per uploaded PDF.
 flowchart TD
     PDF["Uploaded PDF"] --> Parse["Parse PDF\n(PyMuPDF)"]
     Parse --> Length{"Page count\n> 20?"}
-    Length -->|"≤ 20 pages"| Narrative["📝 Narrative Agent\nSingle-pass ToolCallingAgent\nReads full text → extracts requirements"]
+    Length -->|"≤ 20 pages"| Narrative["📝 Narrative Agent\nSingle-pass \nReads full text → extracts requirements and term definitions"]
     Length -->|"> 20 pages"| Compliance["📚 Compliance Extraction Pipeline\n"]
     Narrative --> Reqs
     Compliance -->|"Enriched schema\n+ progress streaming"| Reqs
@@ -67,7 +65,7 @@ Fans out N requirements to concurrent workers, streams results via SSE, then run
 
 ```mermaid
 flowchart TD
-    Reqs["64 Requirements"] --> Dispatch["Parallel Dispatcher\nasyncio.Semaphore(8)"]
+    Reqs["Requirements"] --> Dispatch["Parallel Dispatcher\nasyncio.Semaphore"]
     Dispatch --> W1["Worker 1\nQuestion Agent"]
     Dispatch --> W2["Worker 2\nQuestion Agent"]
     Dispatch --> W3["..."]
