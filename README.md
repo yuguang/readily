@@ -40,16 +40,18 @@ flowchart TD
 
 ### 2. Compliance Extraction Agent (Long Documents)
 
-For long regulatory PDFs (e.g. 145-page DHCS policy guides). Segments the document, filters for obligation language, extracts per-section in parallel, then deduplicates and assembles a hierarchy.
+For long regulatory PDFs, segments the document, filters for obligation language, extracts per-section in parallel, then deduplicates and assembles a hierarchy.
 
 ```mermaid
 flowchart TD
-    PDF["PDF (145 pages)"] --> S1["1. Structured Parsing\nPyMuPDF: headings + tables + page numbers"]
-    S1 --> S2["2. Section Segmentation\nSplit on headings → 52 sections"]
+    PDF["PDF"] --> S1["1. Structured Parsing\nPyMuPDF: headings + tables + page numbers"]
+    S1 --> S2["2. Section Segmentation\nSplit on headings"]
     S2 --> S3["3. Obligation Filtering\nRule-based keyword match\n(must / shall / required / prohibited)"]
-    S3 -->|"~28 sections pass\n~24 skipped"| S4
-    S4["4. Per-Section LLM Extraction\nToolCallingAgent × 28 sections\n(parallelized, 8 workers)"]
-    S4 --> S5["5. Deduplication\nEmbedding similarity > 0.90\n87 → 62 requirements"]
+    S3 -->|"~x sections pass\n~y skipped"| S4
+
+    S4["4. Per-Section LLM Extraction\nToolCallingAgent (parallelized, 8 workers)\n─────────────────────────────\nget_text_tool · strip_tool · parse_list_tool\nbatch_resolve_tool · resolve_tool"]
+
+    S4 --> S5["5. Deduplication\nEmbedding similarity > 0.90\n"]
     S5 --> S6["6. Hierarchy Assembly\nLink sub-requirements to parents\n(H1 → H2 → H3 nesting)"]
     S6 --> S7["7. Finalize\nAssign sequential IDs"]
     S7 --> Out["list of ComplianceRequirement\n(enriched schema)"]
