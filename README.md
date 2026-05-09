@@ -2,6 +2,9 @@
 
 Automates healthcare P&P policy audits against regulatory checklists. AI agents review each compliance question against 373+ policy PDFs using RAG, then stream results to a React UI for human approval.
 
+### Demo video
+https://github.com/user-attachments/assets/fc8d99a0-0c82-434b-ac89-87e1d60745ce
+
 ## Agentic Workflows
 
 ### End-to-End Pipeline
